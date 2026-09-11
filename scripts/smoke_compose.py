@@ -805,6 +805,87 @@ ok, out = psql("SELECT count(*) FROM vehicle_current WHERE vehicle_id LIKE 'veh-
 check("  simulated vehicles are materialised in the sink",
       ok and out.strip().isdigit() and int(out.strip()) > 0, f"{out.strip()} row(s)")
 
+print("\n=== 13. every process exits cleanly on SIGTERM (M8) ===")
+
+# The defect this checks for has already happened twice on this project, and both times it took a
+# goroutine dump to find it: a prober ranging over a ticker whose Stop() does not close the
+# channel, and a consumer holding an unreleased rebalance block. In both cases the process ignored
+# SIGTERM for its entire grace period and had to be killed.
+#
+# `docker stop` cannot tell you that happened. A SIGKILL after the timeout still stops the
+# container and the command still returns success, so the exit code, the process's own shutdown
+# log line and the wall-clock time are all asserted — 137 is 128 + SIGKILL, which is the kernel
+# ending a process that would not end itself.
+# The grace period is named once, so the stop call and the message about it cannot disagree.
+GRACE_SECONDS = 15
+
+
+def stop_and_report(container, grace=GRACE_SECONDS):
+    """Stop a container and return (ok, seconds, exit code, the log of THIS shutdown).
+
+    The log is read with `--since` rather than `--tail`, and that is the whole point: an earlier
+    section stops and starts the consumer, so a tail-based read could match a "stopped cleanly"
+    line from a shutdown that already happened and satisfy a check named for this one. The window
+    starts just before the stop and is recomputed at read time, so it covers the shutdown however
+    long the stop took.
+    """
+    before = time.time()
+    ok, out = docker(["stop", "-t", str(grace), container], timeout=grace + 30)
+    took = time.time() - before
+    # (ok, output) — the first element is the bool, and the evidence is the second.
+    _, code = docker(["inspect", "-f", "{{.State.ExitCode}}", container])
+    since = f"{int(time.time() - before) + 3}s"
+    _, logs = docker(["logs", "--since", since, container])
+    return ok, took, code.strip(), logs
+
+
+for service, container in (("ingest", "esp-ingest"),
+                           ("consumer", "esp-consumer"),
+                           ("gateway", "esp-gateway")):
+    ok, took, code, logs = stop_and_report(container)
+    check(f"{service} exits 0 on SIGTERM", ok and code == "0",
+          f"exit={code} after {took:.1f}s"
+          + (" (137 = SIGKILL: the kernel had to end it)" if code == "137" else ""))
+
+    reached = "stopped cleanly" in logs
+    # The detail describes whichever outcome happened: on a pass it states what was seen, on a
+    # failure what was missing. The first version always printed the failure sentence, so a
+    # passing check announced that the process died mid-drain.
+    check(f"  {service} reached its own shutdown path", reached,
+          "logged 'stopped cleanly' for this shutdown" if reached
+          else "no 'stopped cleanly' in this shutdown's log, so it died inside its drain")
+
+    # Stopping means stopping, not waiting out the grace period and then being killed.
+    # One second short of the grace period is the bar: a process that needs longer than that is
+    # on the edge of being killed, and the point of the check is to catch a drain that hangs.
+    if took < GRACE_SECONDS - 1:
+        check(f"  {service} stopped without waiting out the grace period", True,
+              f"{took:.1f}s, inside the {GRACE_SECONDS}s grace period")
+    else:
+        check(f"  {service} stopped without waiting out the grace period", False,
+              f"{took:.1f}s — the grace period was consumed, which is what a hung drain looks like")
+
+# Bring the stack back, and prove it came back: a run that verifies shutdown and leaves the
+# deployment down would have tested one thing and broken another.
+ok, _ = docker(["start", "esp-ingest", "esp-consumer", "esp-gateway"], timeout=120)
+check("  the stack restarted", ok)
+
+ingest_ok = gateway_ok = consumer_ok = False
+deadline = time.time() + 120
+while time.time() < deadline:
+    if not ingest_ok:
+        ingest_ok = req("/readyz")[0] == 200
+    if not gateway_ok:
+        gateway_ok = req("/readyz", base=GATEWAY)[0] == 200
+    if not consumer_ok:
+        h, out = docker(["inspect", "-f", "{{.State.Health.Status}}", "esp-consumer"])
+        consumer_ok = bool(h) and out.strip() == "healthy"
+    if ingest_ok and gateway_ok and consumer_ok:
+        break
+    time.sleep(3)
+check("  and all three report healthy again", ingest_ok and gateway_ok and consumer_ok,
+      f"ingest={ingest_ok} gateway={gateway_ok} consumer={consumer_ok}")
+
 print("\n=== SUMMARY ===")
 
 

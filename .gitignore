@@ -32,6 +32,13 @@ data/
 coverage.out
 coverage.html
 
+# Python artifacts. This repository ships three Python scripts (the compose smoke test and the two
+# measurement harnesses), so running or byte-compiling one writes scripts/__pycache__/*.pyc next to
+# the source. A py_compile check during development created one; this rule is why the next one does
+# not become a commit.
+__pycache__/
+*.pyc
+
 # Editor and OS noise.
 .DS_Store
 Thumbs.db

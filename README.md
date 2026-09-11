@@ -31,7 +31,7 @@ What exists today, and what does not:
 | `cmd/gateway` — SSE with `Last-Event-ID` resume, a live map viewer at `/`, a per-client buffer that sheds a slow viewer rather than stalling the fan-out, and a 503 + `Retry-After` refusal at its configured client limit | |
 | The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | |
 | Operational surface on every process: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | |
-| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 75 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, that refusal replayed, an event delivered to an already-connected browser over the bus, a reconnect resuming exactly the missed frames, and a consumer killed with `SIGKILL` and then rewound to the start of the log, where every re-delivered event deduplicated instead of being applied twice | |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 86 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, that refusal replayed, an event delivered to an already-connected browser over the bus, a reconnect resuming exactly the missed frames, a consumer killed with `SIGKILL` and then rewound to the start of the log, where every re-delivered event deduplicated instead of being applied twice, and every process stopped with `SIGTERM` to prove it drains and exits 0 rather than being killed at the end of its grace period | |
 
 ## Measured
 
@@ -70,6 +70,17 @@ What these numbers do not say: nothing here is a production figure. Ingest at 2,
 went through one ingest process and one three-node-replica-free broker; the fan-out ceiling past
 1,000 clients is untested; and the end-to-end figure holds at an offered rate far below the
 ingest ceiling, which is the condition under which a latency number means anything.
+
+**Fuzzing: 1,565,798 executions against the ingest parser and 2,267,015 against the log
+decoder, zero crashers** (45 s per target, `go test -run=NONE -fuzz=... -fuzztime=45s`). The two
+targets are the functions that read bytes this system did not produce: `event.Accept` parses what
+a producer POSTs, and `event.Decode` parses what the consumer reads back off the log. The seeds
+include the envelope shape that must be refused, so a change that starts accepting it fails a run
+rather than passing quietly — and the accepted path asserts the invariants the pipeline leans on:
+the id parses as a UUID, the schema version is one this build implements, and a marshal/decode
+round trip preserves the identity the sink deduplicates on. No file was written under
+`testdata/fuzz`, which is the result a clean run leaves behind; a file there would be a crash Go
+had to reproduce.
 
 **Test coverage: 45.5% of statements**, measured with `go test -covermode=atomic
 -coverprofile=... ./...` against the same real Postgres, Redis and broker the suite requires.
