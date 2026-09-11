@@ -172,6 +172,10 @@ services:
       APP_ENV: dev
       LOG_LEVEL: info
       DATABASE_URL: postgres://esp:esp@postgres:5432/event_stream?sslmode=disable
+      # The fan-out bus (ADR-009). The consumer publishes each committed event to it, so Redis
+      # is a start-up dependency for this process: it pings and exits when unreachable, which
+      # is what a crash loop in this container means rather than a silent degradation.
+      REDIS_URL: redis://redis:6379/0
       BROKER_SEEDS: redpanda:9092
       BROKER_RAW_TOPIC: telemetry.raw.v1
       BROKER_DLQ_TOPIC: telemetry.dlq.v1
@@ -185,6 +189,10 @@ services:
       postgres:
         condition: service_healthy
       redpanda:
+        condition: service_healthy
+      # Now a start-up requirement, not just a runtime one: the process pings Redis and exits
+      # if it cannot reach it, so a cold `up` must not race the bus into a crash loop.
+      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -224,6 +232,43 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+
+  # The SSE gateway: browser-facing, read-only, and the only process that serves a human.
+  #
+  # It depends on Postgres and Redis but not on the broker: a resume reads the durable history,
+  # and live frames arrive over the bus. That is why this service can be restarted, moved, or
+  # scaled without a consumer-group rebalance anywhere.
+  gateway:
+    build: .
+    container_name: esp-gateway
+    entrypoint: ["/bin/gateway"]
+    ports:
+      - "8082:8082"
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://esp:esp@postgres:5432/event_stream?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      GATEWAY_ADDR: ":8082"
+      GATEWAY_CLIENT_BUFFER: "256"
+      GATEWAY_MAX_CLIENTS: "1000"
+      GATEWAY_REPLAY_WINDOW: 15m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Readiness asks Postgres and Redis, and nothing else: those are the two things this process
+    # cannot serve a stream without.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8082/readyz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
 volumes:
   esp_pgdata:

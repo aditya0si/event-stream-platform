@@ -32,9 +32,19 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/aditya0si/event-stream-platform/internal/event"
+	"github.com/aditya0si/event-stream-platform/internal/fanout"
 	"github.com/aditya0si/event-stream-platform/internal/platform/metrics"
 	"github.com/aditya0si/event-stream-platform/internal/sink"
 )
+
+// Publisher puts a durable event on the live bus (ADR-009).
+//
+// It is a narrow interface with one method, and its error is handled by logging rather than by
+// retrying: the event has already been committed to Postgres by the time this is called, so the
+// durable record is safe and a lost frame costs one stale moment on a map.
+type Publisher interface {
+	Publish(ctx context.Context, pos fanout.Position) (int64, error)
+}
 
 // DeadLetterer records a refused event. A refusal that is not recorded must not be committed,
 // so this interface returning an error is load-bearing rather than decorative.
@@ -58,6 +68,12 @@ type Options struct {
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
 	Log         *slog.Logger
+
+	// Publisher is optional. A consumer without one still applies every event to the sink and
+	// commits its offsets; it simply does not feed the live view. That is the right shape for a
+	// deployment with no gateways, and it keeps the tests that are about the sink from having to
+	// stand up a bus they do not exercise.
+	Publisher Publisher
 }
 
 // Consumer applies events from the log to the sink.
@@ -65,6 +81,7 @@ type Consumer struct {
 	cl    *kgo.Client
 	store *sink.Store
 	dlq   DeadLetterer
+	pub   Publisher
 	log   *slog.Logger
 	opts  Options
 }
@@ -98,7 +115,7 @@ func New(cl *kgo.Client, store *sink.Store, dlq DeadLetterer, opts Options) (*Co
 	if opts.MaxRetries == 0 {
 		opts.MaxRetries = 5
 	}
-	return &Consumer{cl: cl, store: store, dlq: dlq, log: opts.Log, opts: opts}, nil
+	return &Consumer{cl: cl, store: store, dlq: dlq, pub: opts.Publisher, log: opts.Log, opts: opts}, nil
 }
 
 // Run polls and processes until the context is cancelled or the client is closed.
@@ -256,12 +273,22 @@ func (c *Consumer) processOne(ctx context.Context, r *kgo.Record) bool {
 			switch outcome {
 			case sink.OutcomeApplied:
 				metrics.ConsumerEventsTotal.WithLabelValues("applied").Inc()
+				c.publish(ctx, env, pos)
 			case sink.OutcomeDuplicate:
 				// The evidence that at-least-once is being absorbed rather than tolerated.
+				//
+				// Nothing is published: this event was already applied by an earlier
+				// transaction, so the live view either received it then or the client will pick
+				// it up from the history on its next resume. Re-sending it would add a frame
+				// nobody needs.
 				metrics.ConsumerEventsTotal.WithLabelValues("duplicate").Inc()
 			case sink.OutcomeLate:
-				// Preserved in history, refused by current state (ADR-005).
+				// Preserved in history, refused by current state (ADR-005). It is published,
+				// because a viewer draws the history — the same rows a resume replays — and
+				// suppressing it here would make the live view disagree with what a reconnect
+				// immediately afterwards would send.
 				metrics.ConsumerEventsTotal.WithLabelValues("late").Inc()
+				c.publish(ctx, env, pos)
 			}
 			return true
 		}
@@ -286,6 +313,52 @@ func (c *Consumer) processOne(ctx context.Context, r *kgo.Record) bool {
 			return false
 		case <-time.After(backoff):
 		}
+	}
+}
+
+// publish offers an event that is now durable to the live bus.
+//
+// # Why this runs here and never inside the transaction
+//
+// The sink's transaction has already committed when this is called, and that ordering is the
+// entire reason a lost frame is acceptable. Publishing before the commit would let a rollback
+// leave an event on every viewer's map with no row behind it — the live view would be the only
+// place the event ever existed, which is the opposite of what a durable log is for.
+//
+// A publish failure never fails the event: it is counted, logged, and the offset still commits.
+// The bus is best-effort by design (ADR-009), and a client that needs exactness resumes from its
+// last event id, which reads the history rather than the bus.
+func (c *Consumer) publish(ctx context.Context, env event.Envelope, pos event.VehiclePosition) {
+	if c.pub == nil {
+		return
+	}
+
+	started := time.Now()
+	n, err := c.pub.Publish(ctx, fanout.Position{
+		EventID:    env.EventID,
+		VehicleID:  pos.VehicleID,
+		RouteID:    pos.RouteID,
+		Lat:        pos.Lat,
+		Lon:        pos.Lon,
+		SpeedKPH:   pos.SpeedKPH,
+		BearingDeg: pos.BearingDeg,
+		EventTS:    pos.EventTS,
+		Sequence:   pos.Sequence,
+	})
+	metrics.FanOutPublishDuration.Observe(time.Since(started).Seconds())
+
+	switch {
+	case err != nil:
+		metrics.FanOutEventsTotal.WithLabelValues("failed").Inc()
+		c.log.Warn("publishing to the fan-out bus failed; the event is durable and the live "+
+			"view catches up on the next one", "event_id", env.EventID, "err", err)
+	case n == 0:
+		// Redis accepted the publish with no subscribers attached. Not a failure: no gateway is
+		// running, so there is nobody to tell. Counted separately because "the bus is quiet" and
+		// "the bus is broken" are different things to see on a dashboard.
+		metrics.FanOutEventsTotal.WithLabelValues("no_subscribers").Inc()
+	default:
+		metrics.FanOutEventsTotal.WithLabelValues("published").Inc()
 	}
 }
 

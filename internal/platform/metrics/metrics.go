@@ -153,6 +153,17 @@ var (
 		Help:    "Time to publish one event to the fan-out bus.",
 		Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05},
 	})
+
+	// FanOutEventsTotal is the count of frames offered to the bus and what became of them.
+	//
+	// It is a separate counter from the consumer's own outcomes because the two can differ,
+	// and the difference is informative: an event applied to the sink whose fan-out publish
+	// failed is still perfectly durable, and the live view is one frame behind until the next
+	// event. Without this counter that gap is invisible.
+	FanOutEventsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fanout_events_total",
+		Help: "Frames published to the fan-out bus, by result.",
+	}, []string{"result"}) // published | failed | no_subscribers
 )
 
 // --- dependencies ---
@@ -180,7 +191,7 @@ func Register(reg *prometheus.Registry) {
 		ConsumerEventsTotal, ConsumerLag, ConsumerTxDuration, ConsumerRetriesTotal, ConsumerBatchSize,
 		DeadLetterTotal, DLQDepth,
 		GatewayClients, GatewayEventsSent, GatewayDisconnectsTotal, GatewayReplayEvents,
-		FanOutPublishDuration,
+		FanOutPublishDuration, FanOutEventsTotal,
 		BrokerUp, RedisUp, DBUp,
 	)
 }

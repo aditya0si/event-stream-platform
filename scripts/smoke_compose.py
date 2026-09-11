@@ -16,15 +16,19 @@ Exits non-zero on any failed check, so it is a gate rather than a report.
 
 import json
 import re
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 INGEST = "http://localhost:8081"
+# The SSE gateway. Separate process, separate port: it serves browsers, not producers.
+GATEWAY = "http://localhost:8082"
 
 results = []
 
@@ -379,6 +383,169 @@ else:
           f"searched {n} record(s)")
     check("  and the original bytes came back unchanged", poison_marker in out,
           "the marker from the refused payload was found in the log again")
+
+print("\n=== 10. the live stream, and a reconnect that resumes exactly the missed frames (M5) ===")
+
+
+def fetch_text(path, base=GATEWAY, timeout=10):
+    """Fetch a response as text, for the endpoints that are not JSON.
+
+    `req` parses JSON, so it would report the HTML viewer as a failure — and the viewer being
+    served is one of the things this section has to check.
+    """
+    try:
+        with urllib.request.urlopen(base + path, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace"), \
+                resp.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        return e.code, "", e.headers.get("Content-Type", "")
+    except Exception as e:
+        return 0, "", str(e)
+
+
+def stream_read(path, headers=None, until=None, seconds=12, base=GATEWAY):
+    """Read an SSE stream, returning (status, text, error).
+
+    The socket timeout is per read rather than per stream: an SSE response is open by design, so
+    a timeout means "nothing arrived yet", not "this failed". The overall deadline is what ends
+    the loop.
+    """
+    text, status = "", 0
+    deadline = time.time() + seconds
+    try:
+        req = urllib.request.Request(base + path, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            status = resp.status
+            while time.time() < deadline:
+                try:
+                    line = resp.readline()
+                except (socket.timeout, TimeoutError):
+                    continue
+                if not line:
+                    break
+                text += line.decode("utf-8", errors="replace")
+                if until and until(text):
+                    break
+    except urllib.error.HTTPError as e:
+        return e.code, text, f"HTTP {e.code}"
+    except Exception as e:
+        return status, text, str(e)
+    return status, text, ""
+
+
+s, b = req("/readyz", base=GATEWAY)
+check("the gateway reports ready", s == 200, f"{s} {b}")
+
+s, html, ctype = fetch_text("/")
+check("the viewer is served at / and carries the live script",
+      s == 200 and "new EventSource" in html and "text/html" in ctype, f"{s} {ctype}")
+
+s, _, _ = fetch_text("/definitely-not-a-route")
+check("  an unknown path is a 404, not the viewer", s == 404, f"{s}")
+
+status, text, err = stream_read("/v1/stream", until=lambda t: '"resumed":false' in t, seconds=8)
+ready_ok = status == 200 and "event: ready" in text
+# The detail must describe the *passing* case too: an `err or "no frame"` fallback reads like a
+# failure on a passing check, which makes the transcript argue with itself.
+check("a fresh stream opens with a ready frame", ready_ok,
+      f"{status}, {len(text)}B received" if ready_ok else (err or "no ready frame within 8s"))
+# `id:` on a control frame would become the client's Last-Event-ID on reconnect, pointing at a
+# frame the history has never heard of.
+# The ready frame is isolated before asserting, so a position frame arriving in the same read
+# window cannot make this check lie in either direction.
+ready_frame = text.split("event: ready", 1)[1].split("\n\n", 1)[0] if "event: ready" in text else ""
+check("  and its control frame carries no id", "id:" not in ready_frame,
+      ready_frame.replace("\n", " ")[:100])
+
+# A live frame, delivered over the bus rather than polled: the client connects *before* the event
+# is posted, so Redis Pub/Sub is the only way it can arrive. This is the M5 wire end to end.
+live_vehicle = "smoke-live-" + uuid.uuid4().hex[:8]
+bucket = {}
+
+
+def live_reader():
+    bucket["status"], bucket["text"], bucket["err"] = stream_read(
+        "/v1/stream", until=lambda t: '"event_id":"' in t, seconds=15)
+
+
+reader = threading.Thread(target=live_reader, daemon=True)
+reader.start()
+time.sleep(1.0)  # let the subscription establish before the event exists
+
+s, b = post("/v1/events", {"events": [{
+    "vehicle_id": live_vehicle, "route_id": "smoke-r-live",
+    "lat": 13.05, "lon": 77.62, "speed_kph": 24.0, "sequence": 1,
+    "event_ts": datetime.now(timezone.utc).isoformat(),
+}]})
+check("  an event posted to a connected client is accepted", s == 202, f"{s} {b}")
+reader.join(timeout=20)
+
+m = re.search(r'"event_id":"([0-9a-f-]{36})"', bucket.get("text", ""))
+live_id = m.group(1) if m else ""
+if live_id:
+    ok, out = psql(f"SELECT count(*) FROM vehicle_positions WHERE event_id = '{live_id}'")
+else:
+    ok, out = False, ""
+check("  it reaches the stream over the live bus, and is durable",
+      bool(live_id) and ok and out == "1",
+      f"frame_id={live_id or '(none)'} row={out or '(none)'} err={bucket.get('err') or ''}")
+
+# Resume. Three events share one event_ts on purpose: a resume that filtered on the timestamp
+# alone would drop the two that follow the resume point inside the same second, which is exactly
+# the difference between comparing (event_ts, event_id) and a plain `event_ts >`.
+resume_vehicle = "smoke-resume-" + uuid.uuid4().hex[:8]
+shared_ts = (datetime.now(timezone.utc) - timedelta(seconds=30)).replace(microsecond=0).isoformat()
+s, b = 0, {}
+for seq in (1, 2, 3):
+    s, b = post("/v1/events", {"events": [{
+        "vehicle_id": resume_vehicle, "route_id": "smoke-r-resume",
+        "lat": 13.06, "lon": 77.63, "speed_kph": 20.0, "sequence": seq, "event_ts": shared_ts,
+    }]})
+    if s != 202:
+        break
+check("three events sharing one event_ts were accepted", s == 202, f"{s} {b}")
+
+ids = []
+deadline = time.time() + 60
+while time.time() < deadline:
+    ok, out = psql(f"SELECT event_id FROM vehicle_positions WHERE vehicle_id = '{resume_vehicle}' "
+                   f"ORDER BY event_ts, event_id")
+    ids = out.split() if ok else []
+    if len(ids) == 3:
+        break
+    time.sleep(2)
+check("  all three reached the history", len(ids) == 3, f"{len(ids)} row(s)")
+
+if len(ids) != 3:
+    check("a reconnect resumes from the client's last event id", False, "no rows to resume from")
+else:
+    resume_id = ids[0]
+    status, text, err = stream_read("/v1/stream", headers={"Last-Event-ID": resume_id},
+                                    until=lambda t: '"frames":' in t, seconds=12)
+    resumed_ok = status == 200 and '"frames":' in text
+    check("a reconnect resumes from the client's last event id", resumed_ok,
+          f"{status}, resumed" if resumed_ok else (err or "no resumed frame within 12s"))
+    check("  exactly the events newer than the resume point arrive",
+          all(i in text for i in ids[1:]), f"expected {ids[1:]}")
+    check("  and the resume point itself is not replayed", resume_id not in text,
+          "the client already has that event")
+    # Not an exact count: any event applied after the resume point is one the client genuinely
+    # missed too, so the replay legitimately includes it. The claims worth making are that the
+    # same-second siblings arrived and the resume point itself did not.
+    m = re.search(r'"frames":(\d+)', text)
+    frames_n = int(m.group(1)) if m else 0
+    check("  the resumed frame reports at least the two missed frames", frames_n >= 2,
+          f"frames={frames_n}")
+
+# The read a viewer uses on first load. Its unit test runs against a fake history, so only the
+# deployed path executes the SQL — a LEFT JOIN and a coalesce that no fake ever runs.
+if ids:
+    s, body = req(f"/v1/vehicles/{resume_vehicle}", base=GATEWAY)
+    check("GET /v1/vehicles/{id} answers from the deployed sink",
+          s == 200 and resume_vehicle in json.dumps(body), f"{s} {json.dumps(body)[:90]}")
+
+s, _ = req("/v1/vehicles/smoke-never-seen-" + uuid.uuid4().hex[:8], base=GATEWAY)
+check("  an unknown vehicle is a 404, not a 500", s == 404, f"{s}")
 
 print("\n=== SUMMARY ===")
 passed = sum(1 for _, ok, _ in results if ok)

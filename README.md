@@ -5,8 +5,9 @@ Postgres sink, dead-letter handling with replay, and a live browser fan-out over
 
 ## Status
 
-**M4 complete: a refused event is recoverable, not lost.** `docker compose up --build` brings up
-Postgres, Redis, Redpanda, a one-shot migration container, the ingest service, and the consumer.
+**M5 complete: the live view, and a reconnect that loses nothing.** `docker compose up --build`
+brings up Postgres, Redis, Redpanda, a one-shot migration container, the ingest service, the
+consumer, and the SSE gateway.
 `POST /v1/events` validates a batch, gives each event an identity, and publishes it to
 `telemetry.raw.v1` **keyed by vehicle** — so one vehicle's events share a partition in produce
 order, which is what the per-vehicle ordering guarantee
@@ -14,19 +15,22 @@ order, which is what the per-vehicle ordering guarantee
 that log, applies each event to Postgres exactly once, commits its offsets only after the
 transaction that applied them has committed, and records what it cannot apply in two places: a row
 an operator can query, and a copy on `telemetry.dlq.v1` that survives the queryable store being
-unavailable. `cmd/replay` puts a refusal back on the log it came from.
+unavailable. `cmd/replay` puts a refusal back on the log it came from. `cmd/gateway` streams what
+the consumer commits to browsers over SSE, and a reconnecting client gets exactly the frames it
+missed, read from Postgres rather than reconstructed from the bus.
 
 What exists today, and what does not:
 
 | Working now | Not yet |
 |---|---|
-| `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | `cmd/gateway` — SSE fan-out and the viewer (M5) |
+| `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | Viewer authentication — the browser's `EventSource` cannot set request headers, so a header key would authenticate nothing; the honest fix is a signed cookie or a short-lived stream token |
 | `POST /v1/events` — batch validation, per-event rejection with the offending field, and 503 + `Retry-After` when the log is unreachable | `cmd/simulate` — the deterministic fleet producer the benchmarks will drive (M7) |
 | `cmd/consumer` — a consumer group that deduplicates in the same transaction as its effects, keeps every observation in history while refusing to move current state backwards, and dead-letters what it cannot apply | Any benchmark number, which is why none appears below |
 | `cmd/replay` — `list`, `show`, and `replay`, republishing an event's original bytes with provenance headers so the ordinary consumer processes it and the same deduplication guarantee applies | |
+| `cmd/gateway` — SSE with `Last-Event-ID` resume, a live map viewer at `/`, a per-client buffer that sheds a slow viewer rather than stalling the fan-out, and a 503 + `Retry-After` refusal at its configured client limit | |
 | The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | |
-| Operational surface on both processes: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | |
-| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 33 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, and that same refusal replayed | |
+| Operational surface on every process: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 48 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, that refusal replayed, an event delivered to an already-connected browser over the bus, and a reconnect resuming exactly the missed frames | |
 
 Three properties are decisions rather than accidents. Ingest **does not deduplicate**: it durably
 records what arrived and lets the consumer's transaction refuse the second effect
@@ -52,7 +56,8 @@ docker compose up --build
 ```
 
 That is the whole setup. Ports are offset from the sibling project so both stacks can run at once:
-Postgres `5433`, Redis `6380`, Redpanda `19092` (external Kafka listener), ingest `8081`.
+Postgres `5433`, Redis `6380`, Redpanda `19092` (external Kafka listener), ingest `8081`, gateway
+`8082`. Open `http://localhost:8082/` for the live map.
 
 Against dependencies you already run:
 
@@ -60,17 +65,21 @@ Against dependencies you already run:
 go run ./cmd/migrate all            # schema + topics; idempotent
 go run ./cmd/migrate status         # what is applied, what is pending
 go run ./cmd/ingest                 # DATABASE_URL is required; everything else has a default
-go run ./cmd/consumer               # the consumer group; needs the broker and the database
+go run ./cmd/consumer               # the consumer group; needs the broker, the database, and Redis
+go run ./cmd/gateway                # the SSE gateway and the viewer; needs Postgres and Redis
 ```
 
 `make` targets wrap the same commands, and the raw commands above are listed in the Makefile for
 hosts without it. [`.env.example`](.env.example) documents every variable.
 
-## What it will be
+## Component map
+
+Every row is implemented and running except the source, which is marked: the benchmark milestone
+drives the system with `cmd/simulate` rather than by hand.
 
 | Stage | Component |
 |---|---|
-| Source | `cmd/simulate` — a deterministic fleet telemetry producer over committed route geometry |
+| Source | `cmd/simulate` — a deterministic fleet telemetry producer over committed route geometry (M7, not yet) |
 | Ingest | `cmd/ingest` — HTTP batch endpoint with validation and an OpenAPI contract |
 | Log | Redpanda (`telemetry.raw.v1`, partitioned by vehicle) |
 | Processing | `cmd/consumer` — a consumer group with idempotent, deduplicated processing |

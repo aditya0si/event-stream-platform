@@ -128,20 +128,28 @@ jobs:
       - name: start the stack
         run: docker compose up -d --build
 
-      - name: wait for ingest to be ready
+      - name: wait for ingest and gateway to be ready
         run: |
-          for i in $(seq 1 60); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/readyz || true)
-            if [ "$code" = "200" ]; then
-              echo "ingest ready after ${i} attempt(s)"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::ingest did not become ready within 120s"
-          docker compose ps
-          docker compose logs
-          exit 1
+          # Both browser-facing processes must be up before the smoke test starts: section 10
+          # drives the gateway end to end, and on a cold stack the console needs a moment after
+          # the migration container exits.
+          wait_for() {
+            name="$1"; port="$2"
+            for i in $(seq 1 60); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$port/readyz" || true)
+              if [ "$code" = "200" ]; then
+                echo "$name ready after ${i} attempt(s)"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$name did not become ready within 120s"
+            docker compose ps
+            docker compose logs
+            return 1
+          }
+          wait_for ingest 8081
+          wait_for gateway 8082
 
       - name: smoke test (the deployed path)
         run: python3 scripts/smoke_compose.py

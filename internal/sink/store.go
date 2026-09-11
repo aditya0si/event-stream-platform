@@ -117,12 +117,13 @@ func (s *Store) Apply(ctx context.Context, in Input) (Outcome, error) {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO vehicle_positions (
 				event_id, vehicle_id, route_id, lat, lon, speed_kph, bearing_deg,
-				event_ts, produced_at, partition, "offset"
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				event_ts, produced_at, partition, "offset", sequence
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (event_id) DO NOTHING`,
 			in.Envelope.EventID, in.Position.VehicleID, in.Position.RouteID,
 			in.Position.Lat, in.Position.Lon, in.Position.SpeedKPH, in.Position.BearingDeg,
 			in.Position.EventTS, in.Envelope.ProducedAt, in.Partition, in.Offset,
+			int64(in.Position.Sequence),
 		); err != nil {
 			return fmt.Errorf("insert vehicle_positions: %w", err)
 		}

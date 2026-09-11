@@ -22,10 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/aditya0si/event-stream-platform/internal/consumer"
+	"github.com/aditya0si/event-stream-platform/internal/fanout"
 	"github.com/aditya0si/event-stream-platform/internal/platform/broker"
 	"github.com/aditya0si/event-stream-platform/internal/platform/config"
 	"github.com/aditya0si/event-stream-platform/internal/platform/db"
@@ -92,6 +94,34 @@ func run() error {
 		return err
 	}
 
+	// The live-view publisher (ADR-009). Wired here rather than inside the consumer because the
+	// consumer must keep working when the bus is gone: the event is durable in Postgres the
+	// moment the sink's transaction commits, and a frame that never leaves is one stale moment
+	// on a map, not a lost event.
+	//
+	// ParseURL is used instead of extracting the address, so the URL's database index and TLS
+	// settings are honoured. (cmd/ingest parses only the address; this is the form to converge
+	// on, and the difference is noted rather than left for someone to discover.)
+	redisOpts, err := redis.ParseURL(cfg.Redis.URL)
+	if err != nil {
+		return fmt.Errorf("redis: parse %q: %w", cfg.Redis.URL, err)
+	}
+	redisOpts.DialTimeout = cfg.Redis.DialTimeout
+	redisOpts.ReadTimeout = cfg.Redis.ReadTimeout
+	redisOpts.WriteTimeout = cfg.Redis.WriteTimeout
+
+	rdb := redis.NewClient(redisOpts)
+	defer func() { _ = rdb.Close() }()
+	if err := rdb.Ping(startupCtx).Err(); err != nil {
+		return fmt.Errorf("redis: ping failed: %w", err)
+	}
+	log.Info("connected to redis", "channel", cfg.Redis.Channel)
+
+	publisher, err := fanout.NewPublisher(rdb, cfg.Redis.Channel)
+	if err != nil {
+		return err
+	}
+
 	// The group client. Three options are load-bearing and are explained where they are set
 	// rather than in a document the reader may not have open.
 	group, err := kgo.NewClient(
@@ -144,6 +174,7 @@ func run() error {
 		MaxRetries:  cfg.Consumer.MaxRetries,
 		BackoffBase: cfg.Consumer.RetryBackoffBase,
 		BackoffMax:  cfg.Consumer.RetryBackoffMax,
+		Publisher:   publisher,
 		Log:         log,
 	})
 	if err != nil {
