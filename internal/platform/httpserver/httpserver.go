@@ -68,6 +68,13 @@ type Config struct {
 	// EnableMetrics mounts /metrics. Set false for processes whose metrics have their own
 	// listener.
 	EnableMetrics bool
+	// Mount, when set, is called with the mux so a caller can attach its own routes. The
+	// operational endpoints above are owned here; everything else belongs to the binary.
+	Mount func(mux *http.ServeMux)
+	// Wrap, when set, wraps the finished handler. Used for cross-cutting middleware such as
+	// request-id assignment, which must apply to the application's routes and to the
+	// operational ones alike.
+	Wrap func(http.Handler) http.Handler
 }
 
 // Server owns the listener and its lifecycle.
@@ -119,9 +126,18 @@ func New(cfg Config) (*Server, error) {
 		mux.Handle("GET /metrics", handler)
 	}
 
+	if cfg.Mount != nil {
+		cfg.Mount(mux)
+	}
+
+	var root http.Handler = mux
+	if cfg.Wrap != nil {
+		root = cfg.Wrap(mux)
+	}
+
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           root,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

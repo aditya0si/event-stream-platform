@@ -5,19 +5,29 @@ Postgres sink, dead-letter handling with replay, and a live browser fan-out over
 
 ## Status
 
-**M1 complete: the stack runs.** `docker compose up --build` brings up Postgres, Redis, Redpanda,
-a one-shot migration container, and the ingest service; the migration applies the schema and creates
-both topics with the partition counts the design requires (6 and 3, asserted rather than assumed).
+**M2 complete: events are ingested and durable in the log.** `docker compose up --build` brings up
+Postgres, Redis, Redpanda, a one-shot migration container, and the ingest service. `POST /v1/events`
+validates a batch of observations, gives each event an identity, and publishes it to
+`telemetry.raw.v1` **keyed by vehicle** — so one vehicle's events share a partition in produce
+order, which is what the per-vehicle ordering guarantee
+([ADR-005](docs/adr/ADR-005-ordering-and-late-data.md)) actually rests on.
 
 What exists today, and what does not:
 
 | Working now | Not yet |
 |---|---|
 | `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | `cmd/consumer` — the consumer group (M3) |
-| `cmd/ingest` — operational surface: `/healthz`, `/readyz`, `/metrics` | `/v1/events` — the ingest endpoint itself (M2) |
-| The event envelope and its schema versioning | `cmd/replay` — dead-letter inspection (M4) |
-| Dependency health as metrics (`db_up`, `redis_up`, `broker_up`), kept fresh by a background prober | `cmd/gateway` — SSE fan-out and the viewer (M5) |
-| CI: `gofmt`, `vet`, the migrations against a real broker, the suite, a build, and a job that starts the whole stack and smoke-tests it | Any benchmark number, which is why none appears below |
+| `POST /v1/events` — batch validation, per-event rejection with the offending field, and 503 + `Retry-After` when the log is unreachable | `cmd/replay` — dead-letter inspection (M4) |
+| The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | `cmd/gateway` — SSE fan-out and the viewer (M5) |
+| Operational surface: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | Any benchmark number, which is why none appears below |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 20 checks, including reading a posted event back off the broker | |
+
+Two properties are decisions rather than accidents. Ingest **does not deduplicate**: it durably
+records what arrived and lets the consumer's transaction refuse the second effect
+([ADR-006](docs/adr/ADR-006-dedup-store.md)), because a dedupe cache at this layer would be a
+second, uncoordinated dedupe — and the one that lies when it loses an entry. And a
+partially-acknowledged produce is reported as **failure** so the caller retries the batch: a
+duplicate the pipeline provably absorbs is worth more than a silence nothing can detect.
 
 The design documents came first: [`docs/DESIGN.md`](docs/DESIGN.md) states the requirements,
 architecture, data model, event flows, failure table, and explicit non-goals, and

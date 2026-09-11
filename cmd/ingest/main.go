@@ -1,12 +1,12 @@
-// Command ingest is the HTTP entry point for telemetry.
+// Command ingest is the HTTP entry point for telemetry: it validates submitted observations,
+// gives each event an identity, and publishes it to the partitioned log.
 //
-// At this milestone it serves the operational surface — liveness, readiness, and metrics
-// — and proves the wiring to Postgres, Redis, and the broker. The `/v1/events` endpoint
-// arrives in the next milestone, and this comment will not claim it exists before it does.
+// It also serves the operational surface — liveness, readiness, metrics — on the same
+// listener, so there is one shutdown path rather than two.
 //
 // The process-refuses-to-start-if-a-dependency-is-down rule is deliberate: a container
-// that reports healthy while unable to reach its database is worse than one that exits,
-// because the orchestrator's restart policy is the only recovery mechanism it has.
+// that reports healthy while unable to reach its database or its log is worse than one that
+// exits, because the orchestrator's restart policy is the only recovery mechanism it has.
 package main
 
 import (
@@ -20,12 +20,14 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/aditya0si/event-stream-platform/internal/ingest"
 	"github.com/aditya0si/event-stream-platform/internal/platform/broker"
 	"github.com/aditya0si/event-stream-platform/internal/platform/config"
 	"github.com/aditya0si/event-stream-platform/internal/platform/db"
 	"github.com/aditya0si/event-stream-platform/internal/platform/httpserver"
 	"github.com/aditya0si/event-stream-platform/internal/platform/logging"
 	"github.com/aditya0si/event-stream-platform/internal/platform/metrics"
+	"github.com/aditya0si/event-stream-platform/internal/platform/reqid"
 )
 
 func main() {
@@ -75,14 +77,17 @@ func run() error {
 	}
 	log.Info("connected to redis")
 
-	brokerClient, err := broker.NewClient(startupCtx, broker.Options{
+	// One broker client, used both for publishing and for the readiness probe. Two clients
+	// would work, but a single connection means the health signal an operator reads describes
+	// the same connection the events travel over.
+	producer, err := broker.NewProducer(startupCtx, broker.Options{
 		SeedBrokers: cfg.Broker.SeedBrokers,
 		ClientID:    "esp-ingest",
 	})
 	if err != nil {
 		return err
 	}
-	defer brokerClient.Close()
+	defer producer.Close()
 	log.Info("connected to broker", "seeds", cfg.Broker.SeedBrokers)
 
 	reg := metrics.NewRegistry()
@@ -94,7 +99,22 @@ func run() error {
 	checks := []httpserver.Check{
 		{Name: "postgres", Fn: func(c context.Context) error { return pool.Ping(c) }, Gauge: metrics.DBUp},
 		{Name: "redis", Fn: func(c context.Context) error { return rdb.Ping(c).Err() }, Gauge: metrics.RedisUp},
-		{Name: "broker", Fn: func(c context.Context) error { return broker.Ping(c, brokerClient) }, Gauge: metrics.BrokerUp},
+		{Name: "broker", Fn: func(c context.Context) error { return producer.Ping(c) }, Gauge: metrics.BrokerUp},
+	}
+
+	// The application's routes are attached to the same server as the operational ones, and
+	// request-id assignment wraps the whole thing — including /healthz — so every log line a
+	// probe produces can also be tied to a request.
+	events, err := ingest.New(producer, ingest.Options{
+		Topic:        cfg.Broker.RawTopic,
+		Source:       "ingest",
+		APIKey:       cfg.Ingest.APIKey,
+		MaxBodyBytes: cfg.Ingest.MaxBodyBytes,
+		MaxBatchSize: cfg.Ingest.MaxBatchSize,
+		Log:          log,
+	})
+	if err != nil {
+		return err
 	}
 
 	srv, err := httpserver.New(httpserver.Config{
@@ -109,6 +129,8 @@ func run() error {
 		ProbeInterval:   5 * time.Second,
 		ProbeTimeout:    3 * time.Second,
 		EnableMetrics:   true,
+		Mount:           events.Mount,
+		Wrap:            reqid.Middleware,
 	})
 	if err != nil {
 		return err

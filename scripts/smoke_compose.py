@@ -20,6 +20,8 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 
 INGEST = "http://localhost:8081"
 
@@ -44,6 +46,47 @@ def req(path, base=INGEST, timeout=15):
             return e.code, {"_raw": raw[:200].decode(errors="replace")}
     except Exception as e:  # connection refused, timeout, DNS
         return 0, {"_error": str(e)}
+
+
+def post(path, body, base=INGEST, timeout=15):
+    """POST a JSON body, returning (status, parsed body) even for error responses."""
+    data = json.dumps(body).encode()
+    r = urllib.request.Request(base + path, data=data, method="POST")
+    r.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, (json.loads(raw) if raw else {})
+        except Exception:
+            return e.code, {"_raw": raw[:200].decode(errors="replace")}
+    except Exception as e:
+        return 0, {"_error": str(e)}
+
+
+def broker_message_count(topic):
+    """Total records in a topic, summed from `rpk topic describe -p` high-watermarks.
+
+    Consuming with a fixed --num would either block waiting for messages that never come or
+    read fewer than exist. Reading the count first lets the consume below read exactly what is
+    there and exit promptly.
+    """
+    ok, out = docker(["exec", "esp-redpanda", "rpk", "topic", "describe", topic, "-p"], timeout=60)
+    if not ok:
+        return None
+    lines = [l.split() for l in out.splitlines() if l.strip()]
+    for i, parts in enumerate(lines):
+        if "HIGH-WATERMARK" in parts:
+            col = parts.index("HIGH-WATERMARK")
+            total = 0
+            for row in lines[i + 1:]:
+                if col < len(row) and row[col].isdigit():
+                    total += int(row[col])
+            return total
+    return None
 
 
 def docker(args, timeout=30):
@@ -118,6 +161,38 @@ for topic, want in (("telemetry.raw.v1", 6), ("telemetry.dlq.v1", 3)):
             break
     check(f"{topic} exists with {want} partitions", parts == want,
           f"found {parts}" if parts is not None else "PARTITIONS line not found in describe output")
+
+print("\n=== 6. ingest actually publishes to the log (M2) ===")
+# A 202 on its own proves nothing about durability: a handler that accepted the batch and
+# dropped it would answer identically. The proof is reading the event back off the broker,
+# which is why this consumes rather than trusting the reply.
+event_id = str(uuid.uuid4())
+s, b = post("/v1/events", {"events": [{
+    "vehicle_id": "smoke-v1",
+    "route_id": "smoke-r1",
+    "lat": 12.9716,
+    "lon": 77.5946,
+    "speed_kph": 21.5,
+    "event_ts": datetime.now(timezone.utc).isoformat(),
+    "sequence": 1,
+    "event_id": event_id,
+}]})
+check("POST /v1/events answers 202", s == 202, f"{s} {b}")
+check("  the batch was accepted", isinstance(b, dict) and b.get("accepted") == 1, str(b))
+
+n = broker_message_count("telemetry.raw.v1")
+if n is None:
+    check("  the topic's high-watermarks are readable", False, "rpk topic describe -p failed")
+elif n == 0:
+    check("  the event reached the log", False,
+          "the topic is empty after a successful POST: the handler accepted and published nothing")
+else:
+    # `timeout` runs inside the container (busybox provides it) so a stall fails this check
+    # instead of hanging the script; the outer subprocess timeout is the backstop.
+    ok, out = docker(["exec", "esp-redpanda", "timeout", "45", "rpk", "topic", "consume",
+                      "telemetry.raw.v1", "-o", "start", "--num", str(n), "-f", "%v"], timeout=90)
+    check("  the event reached the log", event_id in out,
+          f"searched {n} record(s) for the posted event id")
 
 print("\n=== SUMMARY ===")
 passed = sum(1 for _, ok, _ in results if ok)
