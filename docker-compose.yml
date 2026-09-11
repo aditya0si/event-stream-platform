@@ -270,6 +270,33 @@ services:
       retries: 5
       start_period: 10s
 
+  # The deterministic fleet producer (ADR-008), behind a `demo` profile.
+  #
+  # Profiled rather than default, and the reason is the smoke test rather than taste: its
+  # assertions depend on drained consumer lag and row counts that do not move, and a producer
+  # running throughout would quietly turn them into measurements of the simulator. This is also
+  # what makes the benchmark reproducible — the load is a process a run starts and stops, not
+  # ambient traffic nobody accounted for.
+  #
+  # `docker compose --profile demo up` is the demo path: the viewer at :8082 then shows a moving
+  # fleet instead of a canvas waiting for its first position. SIM_RATE is the knob; the fleet's
+  # observations carry wall-clock timestamps and fresh event ids, so nothing here is special-
+  # cased by the rest of the system.
+  simulate:
+    build: .
+    container_name: esp-simulate
+    entrypoint: ["/bin/simulate"]
+    profiles: ["demo"]
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: info
+      SIM_INGEST_URL: http://ingest:8081/v1/events
+      SIM_VEHICLES: "40"
+      SIM_RATE: "200"
+    depends_on:
+      ingest:
+        condition: service_healthy
+
 volumes:
   esp_pgdata:
   esp_redisdata:

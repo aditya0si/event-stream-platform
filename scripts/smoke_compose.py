@@ -257,6 +257,34 @@ else:
     check("  the event reached the log", event_id in out,
           f"searched {n} record(s) for the posted event id")
 
+print("\n=== 6b. the submission contract is pinned (flat observation, not the envelope) ===")
+# Sending the envelope shape must be refused, and the refusal must name the field. This mistake
+# has now been made twice — once in cmd/simulate, once in load/ingest.js — and each time it was
+# silent: the batches returned 202 while every event inside them was rejected. A check that ties
+# the two halves of the contract together is cheaper than finding it a third time.
+_s, _b = post("/v1/events", {"events": [{
+    "schema_version": 1,
+    "event_id": str(uuid.uuid4()),
+    "event_type": "vehicle.position",
+    "produced_at": datetime.now(timezone.utc).isoformat(),
+    "source": "smoke",
+    "payload": {"vehicle_id": "smoke-envelope", "route_id": "smoke-r1", "lat": 1.0, "lon": 2.0,
+                "event_ts": datetime.now(timezone.utc).isoformat(), "sequence": 1},
+}]})
+_rejected = (_b.get("rejected") or []) if isinstance(_b, dict) else []
+check("an envelope-shaped submission is refused, naming the offending field",
+      _s == 202 and len(_rejected) == 1 and "schema_version" in json.dumps(_rejected),
+      f"{_s} {json.dumps(_b)[:150]}")
+
+# And the flat shape is accepted, so the check above cannot pass by refusing everything.
+_s, _b = post("/v1/events", {"events": [{
+    "vehicle_id": "smoke-flat-" + uuid.uuid4().hex[:8], "route_id": "smoke-r1",
+    "lat": 12.97, "lon": 77.59, "speed_kph": 12.5, "bearing_deg": 45.0,
+    "event_ts": datetime.now(timezone.utc).isoformat(), "sequence": 1,
+}]})
+check("  and the flat observation it is paired with is accepted",
+      _s == 202 and isinstance(_b, dict) and _b.get("accepted") == 1, f"{_s} {_b}")
+
 print("\n=== 7. the consumer materializes events into Postgres (M3) ===")
 # The proof that the whole deployed path works: an event posted over HTTP must end up as a
 # row in the sink, which can only happen if the broker carried it AND the consumer service
@@ -408,19 +436,31 @@ def stream_read(path, headers=None, until=None, seconds=12, base=GATEWAY):
 
     The socket timeout is per read rather than per stream: an SSE response is open by design, so
     a timeout means "nothing arrived yet", not "this failed". The overall deadline is what ends
-    the loop.
+    the loop, and it should be the only thing that does: the read timeout is set above the
+    gateway's heartbeat interval so ordinary silence never trips it.
+
+    That margin matters because of how Python's socket layer behaves after a timeout — the file
+    object behind the response is poisoned, and every later read raises OSError("cannot read
+    from timed out object") instead of waiting again. The first version of this helper used a
+    3-second timeout and reported exactly that string as the failure of a live-frames check: the
+    error described the reader, not the stream. It is 20 s here (the gateway heartbeats at 15 s)
+    and a poisoned object is treated as "nothing more will arrive" rather than as a fault.
     """
     text, status = "", 0
     deadline = time.time() + seconds
     try:
         req = urllib.request.Request(base + path, headers=headers or {})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             status = resp.status
             while time.time() < deadline:
                 try:
                     line = resp.readline()
                 except (socket.timeout, TimeoutError):
                     continue
+                except OSError:
+                    # TimeoutError is an OSError, so this arm is reached only for the poisoned
+                    # object described above: no further bytes are coming on this connection.
+                    break
                 if not line:
                     break
                 text += line.decode("utf-8", errors="replace")
@@ -698,7 +738,75 @@ check("  and the consumer counted the redeliveries it absorbed", (dups or 0) > 0
       'consumer_events_total{result="duplicate"} = '
       + (f"{dups:.0f}" if dups is not None else "absent"))
 
+print("\n=== 12. the deterministic producer drives the viewer end to end (M7) ===")
+
+# Started explicitly, through its compose profile. The default stack stays quiet on purpose: the
+# sections above assert on drained lag and unmoved row counts, and a producer running throughout
+# would turn those into measurements of the simulator.
+# The container is removed first rather than reused. Its logs already hold the summary from
+# any earlier run, and a stale summary would satisfy the read below even if this run's producer
+# never started — a vacuous pass, which is worse than a failure because it reads as evidence.
+_ = docker(["compose", "--profile", "demo", "rm", "-sf", "simulate"], timeout=120)
+ok, out = docker(["compose", "--profile", "demo", "up", "-d", "--build", "simulate"], timeout=300)
+check("the simulator started under its compose profile", ok,
+      out.strip().splitlines()[-1] if out else "")
+
+# A viewer connected while the fleet is producing. These frames can only arrive by the live path
+# — ingest, log, consumer, bus, gateway — because the fleet posts to the same endpoint a real
+# producer would and nothing else in this run reads its output.
+status, text, err = stream_read("/v1/stream",
+                                until=lambda t: '"vehicle_id":"veh-' in t, seconds=40)
+sim_vehicles = sorted(set(re.findall(r'"vehicle_id":"(veh-\d+)"', text)))
+check("frames from the simulated fleet reach a connected viewer",
+      status == 200 and len(sim_vehicles) > 0,
+      f"{len(sim_vehicles)} distinct simulated vehicle(s) in the stream" if sim_vehicles
+      else (err or "no simulated frame within 40s"))
+
+# The producer's own summary is the other half of the evidence: it says whether the pipeline
+# accepted what the fleet offered. Read after a clean stop, because the summary is printed on
+# shutdown — a SIGKILL would lose exactly the number that makes this section evidence rather
+# than an anecdote.
+ok, out = docker(["compose", "stop", "simulate"], timeout=120)
+check("  the producer stopped cleanly", ok, out.strip().splitlines()[-1] if out else "")
+
+ok, out = docker(["logs", "--tail", "80", "esp-simulate"])
+summary = {}
+for candidate in out.splitlines():
+    stripped = candidate.strip()
+    # By shape, not by prefix: Go sorts map keys when it encodes, so the line begins with
+    # whichever field sorts first and any prefix test would be pinned to a key ordering that is
+    # an implementation detail of the encoder.
+    if stripped.startswith("{") and '"duration_s"' in stripped and '"accepted"' in stripped:
+        try:
+            summary = json.loads(stripped)
+        except ValueError:
+            summary = {}
+check("  it reported its own summary", bool(summary),
+      f"accepted={summary.get('accepted')} offered={summary.get('offered')}" if summary
+      else "no summary line in the container logs")
+if summary:
+    accepted = summary.get("accepted", 0)
+    offered = summary.get("offered", 0)
+    rejected = summary.get("rejected", -1)
+    # accepted == offered, not merely accepted > 0, and this is the check that would have named
+    # the contract mismatch immediately: a producer whose payloads are wrong can have every
+    # event refused while its batches all succeed. The earlier "not one batch was refused" read
+    # as a pass while 680 of 680 events were rejected, because `failed_batches` counts HTTP
+    # failures — a check whose name described a property it never tested.
+    check("  every offered event was accepted", accepted > 0 and accepted == offered,
+          f"accepted={accepted} offered={offered} rejected={rejected}")
+    check("  no event was rejected and no batch failed",
+          rejected == 0 and summary.get("failed_batches", -1) == 0,
+          f"rejected={rejected} failed_batches={summary.get('failed_batches')}")
+
+# The durable end of the same chain: a simulated vehicle's state is in the sink, which can only
+# happen if its events survived ingest, the log, and the consumer's transaction.
+ok, out = psql("SELECT count(*) FROM vehicle_current WHERE vehicle_id LIKE 'veh-%'")
+check("  simulated vehicles are materialised in the sink",
+      ok and out.strip().isdigit() and int(out.strip()) > 0, f"{out.strip()} row(s)")
+
 print("\n=== SUMMARY ===")
+
 
 passed = sum(1 for _, ok, _ in results if ok)
 print(f"  {passed}/{len(results)} checks passed")

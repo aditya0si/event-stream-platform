@@ -34,6 +34,11 @@ var envKeys = []string{
 
 	"GATEWAY_ADDR", "GATEWAY_CLIENT_BUFFER", "GATEWAY_REPLAY_WINDOW", "GATEWAY_MAX_CLIENTS",
 	"GATEWAY_SHUTDOWN_TIMEOUT", "GATEWAY_READ_TIMEOUT", "GATEWAY_WRITE_TIMEOUT",
+
+	// The simulator's knobs are read by Load like everything else, so a developer's shell can
+	// influence a test unless they are cleared here too — which is the whole point of this list.
+	"SIM_INGEST_URL", "SIM_VEHICLES", "SIM_SEED", "SIM_RATE", "SIM_BATCH", "SIM_WORKERS",
+	"SIM_STEP_MS", "SIM_DURATION",
 }
 
 // hermetic unsets every variable Load reads and restores the environment afterwards.
@@ -70,6 +75,39 @@ func TestLoad_RequiresDatabaseURL(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "DATABASE_URL") {
 		t.Fatalf("the error does not name the missing variable: %v", err)
+	}
+}
+
+// TestLoadFor_ProducerNeedsNoDatabase is the regression test for a defect the deployed smoke
+// test caught: cmd/simulate booted under compose with no DATABASE_URL, crashed with "DATABASE_URL
+// is required but is not set", and took three checks down with it — no frames on the stream, no
+// summary, no rows in the sink.
+//
+// It also pins the property that made the fix non-obvious: relaxing the requirement for everyone
+// would have been the easy version and would have dropped what the service role protects, so the
+// second half asserts that a service still refuses to start without a database.
+func TestLoadFor_ProducerNeedsNoDatabase(t *testing.T) {
+	hermetic(t)
+
+	cfg, err := config.LoadFor(config.RoleProducer)
+	if err != nil {
+		t.Fatalf("a producer could not start without a database: %v", err)
+	}
+	if cfg.Postgres.URL != "" {
+		t.Errorf("a producer picked up a database URL (%q) it has no use for", cfg.Postgres.URL)
+	}
+	// The producer's own settings must still arrive with usable defaults, or the fix traded a
+	// crash for a silently misconfigured stream.
+	if cfg.Simulator.IngestURL == "" {
+		t.Error("SIM_INGEST_URL has no default: the fleet would have nowhere to send events")
+	}
+	if cfg.Simulator.Vehicles < 1 || cfg.Simulator.Rate < 1 || cfg.Simulator.BatchSize < 1 {
+		t.Errorf("the simulator's defaults are unusable: %+v", cfg.Simulator)
+	}
+
+	if _, err := config.Load(); err == nil {
+		t.Error("a service started with no DATABASE_URL: the fail-fast property was lost for " +
+			"every process that owns a database")
 	}
 }
 

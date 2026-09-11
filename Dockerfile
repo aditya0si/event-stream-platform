@@ -22,6 +22,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ingest ./cmd/inges
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/consumer ./cmd/consumer \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/simulate ./cmd/simulate \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/replay ./cmd/replay
 
 # Runtime stage.
@@ -39,6 +40,7 @@ COPY --from=build /out/ingest   /bin/ingest
 COPY --from=build /out/migrate  /bin/migrate
 COPY --from=build /out/consumer /bin/consumer
 COPY --from=build /out/gateway  /bin/gateway
+COPY --from=build /out/simulate /bin/simulate
 COPY --from=build /out/replay   /bin/replay
 
 # The ingest HTTP port. The consumer and gateway listeners are published per-service in

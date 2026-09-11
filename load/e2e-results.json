@@ -1,0 +1,27 @@
+{
+  "events_refused_by_ingest": 0,
+  "first_rejections": [],
+  "consumer_lag_at_start": 0,
+  "consumer_lag_at_end": 0,
+  "generated_at": "2026-09-11T16:01:35.136541+00:00",
+  "scenario": {
+    "events_sent": 1000,
+    "target_rate_per_s": 50.0,
+    "ingest": "http://localhost:8081",
+    "gateway": "http://localhost:8082",
+    "nfr2_p95_ms": 500.0
+  },
+  "delivered": 1000,
+  "undelivered": 0,
+  "http_post_ms": {
+    "p50": 8.43,
+    "p95": 16.03
+  },
+  "e2e_ms": {
+    "p50": 14.15,
+    "p95": 22.77,
+    "p99": 25.54,
+    "max": 46.78,
+    "mean": 15.34
+  }
+}

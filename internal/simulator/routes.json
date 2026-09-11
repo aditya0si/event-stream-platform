@@ -1,0 +1,72 @@
+{
+  "note": [
+    "Committed route geometry for cmd/simulate (ADR-008). These are hand-written polylines,",
+    "not excerpts from a mapping product: a handful of waypoints along real Bengaluru",
+    "corridors, enough for vehicles to move along believable paths and for the viewer to draw",
+    "something recognisable. They are deliberately small and reviewable, and they are the",
+    "reason the benchmark is reproducible — the same seed and the same file produce the same",
+    "positions on any machine, with no network call and no external API.",
+    "",
+    "Coordinates are [lat, lon] pairs in WGS84. Every route is a CLOSED circuit: the last point",
+    "repeats the first, so a vehicle that reaches the end continues onto the closing segment",
+    "instead of teleporting back across the map. The closing segment is the return leg — a",
+    "straight line rather than a road, which is the one piece of fiction in this file and is",
+    "stated here rather than left for a reader to notice."
+  ],
+  "routes": [
+    {
+      "id": "orr-north",
+      "name": "Outer Ring Road (north arc)",
+      "points": [
+        [13.0358, 77.5970],
+        [13.0402, 77.6205],
+        [13.0331, 77.6521],
+        [13.0204, 77.6830],
+        [12.9952, 77.7003],
+        [12.9712, 77.7021],
+        [12.9591, 77.6974],
+        [13.0358, 77.5970]
+      ]
+    },
+    {
+      "id": "mg-road",
+      "name": "MG Road to Whitefield",
+      "points": [
+        [12.9756, 77.6068],
+        [12.9784, 77.6408],
+        [12.9762, 77.6701],
+        [12.9703, 77.7124],
+        [12.9698, 77.7500],
+        [12.9756, 77.6068]
+      ]
+    },
+    {
+      "id": "airport",
+      "name": "Vidhana Soudha to Kempegowda Airport",
+      "points": [
+        [12.9794, 77.5907],
+        [13.0051, 77.5924],
+        [13.0358, 77.5970],
+        [13.0702, 77.6165],
+        [13.1104, 77.6338],
+        [13.1541, 77.6712],
+        [13.1986, 77.7066],
+        [12.9794, 77.5907]
+      ]
+    },
+    {
+      "id": "tech-corridor",
+      "name": "Electronic City to Marathahalli",
+      "points": [
+        [12.8452, 77.6602],
+        [12.8804, 77.6451],
+        [12.9002, 77.6394],
+        [12.9172, 77.6229],
+        [12.9352, 77.6245],
+        [12.9488, 77.6602],
+        [12.9591, 77.6974],
+        [12.8452, 77.6602]
+      ]
+    }
+  ]
+}

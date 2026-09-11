@@ -22,7 +22,7 @@ REDIS_URL       ?= redis://localhost:6380/0
 TEST_REDIS_URL  ?= redis://localhost:6380/1
 BROKER_SEEDS    ?= localhost:19092
 
-.PHONY: help up down logs ps migrate status topics seed build test test-with-db fmt vet gate testdb-create testdb-drop smoke
+.PHONY: help up down logs ps demo migrate status topics seed build test test-with-db fmt vet gate testdb-create testdb-drop smoke load-ingest load-e2e load-sse
 
 help:
 	@echo "event-stream-platform"
@@ -38,6 +38,10 @@ help:
 	@echo "  make test            run the suite against the test database and broker"
 	@echo "  make gate            gofmt + vet + build (what CI runs first)"
 	@echo "  make smoke           run the end-to-end smoke test against the running stack"
+	@echo "  make demo            start the deterministic fleet so the viewer has something to draw"
+	@echo "  make load-ingest     k6 ingest benchmark (NFR-1; needs k6 on PATH)"
+	@echo "  make load-e2e        end-to-end latency measurement (NFR-2)"
+	@echo "  make load-sse        concurrent SSE fan-out measurement (NFR-3; needs the demo up)"
 	@echo
 	@echo "Ports: postgres $(PG_PORT), redis 6380, redpanda 19092, ingest 8081"
 	@echo "DATABASE_URL is required by every binary; every other value has a default."
@@ -117,3 +121,26 @@ gate: fmt vet build
 
 smoke:
 	python scripts/smoke_compose.py
+
+# --- the demo and the measurements ---
+
+# The deterministic fleet (ADR-008). Profiled, so the default stack stays quiet: several smoke
+# checks assert on drained consumer lag and row counts that do not move, and a producer running
+# throughout would quietly turn them into measurements of the simulator.
+demo:
+	docker compose --profile demo up -d --build simulate
+	@echo "the fleet is running; open http://localhost:8082/ for the live map"
+	@echo "stop it with: docker compose stop simulate"
+
+# Each of these is the script that produced the artifact the README quotes. They are listed
+# separately rather than chained because they interfere: the ingest benchmark at 2,500 events/s
+# leaves the consumer behind, and a latency run started immediately afterwards would time that
+# backlog instead of the path.
+load-ingest:
+	k6 run load/ingest.js
+
+load-e2e:
+	python scripts/load_e2e.py
+
+load-sse:
+	python scripts/load_sse.py

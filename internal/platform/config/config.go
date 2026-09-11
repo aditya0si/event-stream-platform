@@ -35,9 +35,10 @@ type Config struct {
 	Redis    Redis
 	Broker   Broker
 
-	Ingest   Ingest
-	Consumer Consumer
-	Gateway  Gateway
+	Ingest    Ingest
+	Consumer  Consumer
+	Gateway   Gateway
+	Simulator Simulator
 }
 
 // Postgres is the sink and the deduplication store (see docs/adr/ADR-006).
@@ -103,6 +104,53 @@ type Consumer struct {
 	RetryBackoffMax  time.Duration
 }
 
+// Simulator configures cmd/simulate, the deterministic fleet producer (ADR-008).
+//
+// It is a producer, not a server, which is why these settings describe a rate and a shape rather
+// than an address to listen on. Every one of them is optional: the defaults produce a running
+// fleet against a local compose stack with no configuration at all, because `docker compose up`
+// is supposed to yield a working system including a live viewer (NFR-8).
+type Simulator struct {
+	// IngestURL is the endpoint events are posted to.
+	IngestURL string
+	// Vehicles is the size of the simulated fleet.
+	Vehicles int
+	// Seed makes the run reproducible: the same seed produces the same positions in the same
+	// order, which is what makes two benchmark runs comparable.
+	Seed int64
+	// Rate is the target events per second, across all workers.
+	Rate int
+	// BatchSize is how many observations travel in one HTTP request. It is bounded by
+	// INGEST_MAX_BATCH, which the server enforces.
+	BatchSize int
+	// Workers is how many requests may be in flight at once. Rate only states intent; workers
+	// determine whether the target is reachable when the server is slow.
+	Workers int
+	// StepMS is how much simulated time one step advances, in milliseconds. A smaller step
+	// means smoother motion and more events per vehicle-second.
+	StepMS int
+	// Duration bounds a run. Zero means "until interrupted", which is what a demo wants; a
+	// benchmark sets it so the process stops itself and prints its summary rather than
+	// leaving a harness to guess when to kill it.
+	Duration time.Duration
+	// APIKey authenticates this producer when INGEST_API_KEY is set on the server.
+	APIKey string
+}
+
+func loadSimulator(errs *[]error) Simulator {
+	return Simulator{
+		IngestURL: envString("SIM_INGEST_URL", "http://localhost:8081/v1/events"),
+		Vehicles:  envInt("SIM_VEHICLES", 40, errs),
+		Seed:      int64(envInt("SIM_SEED", 42, errs)),
+		Rate:      envInt("SIM_RATE", 200, errs),
+		BatchSize: envInt("SIM_BATCH", 20, errs),
+		Workers:   envInt("SIM_WORKERS", 8, errs),
+		StepMS:    envInt("SIM_STEP_MS", 1000, errs),
+		Duration:  envDuration("SIM_DURATION", 0, errs),
+		APIKey:    envString("INGEST_API_KEY", ""),
+	}
+}
+
 // Gateway fans events out to browsers over SSE (ADR-003).
 type Gateway struct {
 	Addr string
@@ -120,8 +168,29 @@ type Gateway struct {
 	WriteTimeout    time.Duration
 }
 
-// Load reads the environment and returns a validated Config, or every problem it found.
-func Load() (Config, error) {
+// Role describes what a process does, and therefore which configuration it must be given.
+//
+// One Config type serves every binary (see the note on Config above), but "required" is a
+// property of the process rather than of the file: a service refuses to start without the
+// dependencies it owns, while a client that owns nothing must not be asked for a credential it
+// never reads.
+type Role string
+
+const (
+	// RoleService is a long-running member of the system that owns the database.
+	RoleService Role = "service"
+	// RoleProducer writes to the ingest endpoint over HTTP and opens no connection of its own.
+	RoleProducer Role = "producer"
+)
+
+// Load reads the environment for a service, validating it and reporting every problem it found.
+//
+// It is LoadFor(RoleService), and it is kept because every service calls it by that name —
+// anything that is not a service says so explicitly instead of inheriting the assumption.
+func Load() (Config, error) { return LoadFor(RoleService) }
+
+// LoadFor reads the environment for a process with the given role.
+func LoadFor(role Role) (Config, error) {
 	var errs []error
 
 	cfg := Config{
@@ -130,7 +199,19 @@ func Load() (Config, error) {
 	}
 
 	// --- Postgres ---
-	cfg.Postgres.URL = envRequired("DATABASE_URL", &errs)
+	if role == RoleProducer {
+		// A producer posts to the API and never opens a connection, so a database URL is not
+		// required of it — and a placeholder would be worse than the requirement: it would put
+		// a credential-shaped value in an environment listing that no code reads.
+		//
+		// The deployed smoke test is what found this. cmd/simulate crashed at boot inside
+		// compose with "DATABASE_URL is required but is not set", and three checks failed for
+		// that single reason. Requiring configuration a process will never read is a different
+		// rule from failing fast on configuration it uses.
+		cfg.Postgres.URL = envString("DATABASE_URL", "")
+	} else {
+		cfg.Postgres.URL = envRequired("DATABASE_URL", &errs)
+	}
 	cfg.Postgres.MaxConns = int32(envInt("DB_MAX_CONNS", 10, &errs))
 	cfg.Postgres.MinConns = int32(envInt("DB_MIN_CONNS", 1, &errs))
 	cfg.Postgres.MaxConnLifetime = envDuration("DB_MAX_CONN_LIFETIME", time.Hour, &errs)
@@ -175,6 +256,7 @@ func Load() (Config, error) {
 	cfg.Consumer.RetryBackoffMax = envDuration("CONSUMER_RETRY_BACKOFF_MAX", 30*time.Second, &errs)
 
 	// --- Gateway ---
+	cfg.Simulator = loadSimulator(&errs)
 	cfg.Gateway.Addr = envString("GATEWAY_ADDR", ":8082")
 	cfg.Gateway.ClientBuffer = envInt("GATEWAY_CLIENT_BUFFER", 256, &errs)
 	cfg.Gateway.ReplayWindow = envDuration("GATEWAY_REPLAY_WINDOW", 15*time.Minute, &errs)
@@ -225,6 +307,27 @@ func Load() (Config, error) {
 		errs = append(errs, fmt.Errorf("GATEWAY_MAX_CLIENTS must be >= 1, got %d", cfg.Gateway.MaxClients))
 	}
 
+	// The simulator's knobs. Each has a default, so a mistake here is a misconfiguration rather
+	// than an omission — and the one that matters is a fleet of zero vehicles, which would
+	// produce an empty stream and a benchmark that measures nothing while looking successful.
+	if cfg.Simulator.Vehicles < 1 {
+		errs = append(errs, fmt.Errorf("SIM_VEHICLES must be >= 1, got %d", cfg.Simulator.Vehicles))
+	}
+	if cfg.Simulator.Rate < 1 {
+		errs = append(errs, fmt.Errorf("SIM_RATE must be >= 1, got %d", cfg.Simulator.Rate))
+	}
+	if cfg.Simulator.BatchSize < 1 {
+		errs = append(errs, fmt.Errorf("SIM_BATCH must be >= 1, got %d", cfg.Simulator.BatchSize))
+	}
+	if cfg.Simulator.Workers < 1 {
+		errs = append(errs, fmt.Errorf("SIM_WORKERS must be >= 1, got %d", cfg.Simulator.Workers))
+	}
+	if cfg.Simulator.StepMS < 1 {
+		errs = append(errs, fmt.Errorf("SIM_STEP_MS must be >= 1, got %d", cfg.Simulator.StepMS))
+	}
+	if cfg.Simulator.IngestURL == "" {
+		errs = append(errs, fmt.Errorf("SIM_INGEST_URL must not be empty: the fleet has nowhere to send events"))
+	}
 	// The deduplication window must not be shorter than the log's retention, or a replay
 	// could re-apply events whose dedup record was already pruned (ADR-002). This is a
 	// cross-section invariant, which is exactly why it belongs in one validated struct.

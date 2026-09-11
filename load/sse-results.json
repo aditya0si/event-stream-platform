@@ -1,0 +1,36 @@
+{
+  "generated_at": "2026-09-11T16:06:29Z",
+  "scenario": {
+    "gateway": "http://localhost:8082",
+    "clients_requested": 200,
+    "duration_s": 30.0,
+    "nfr3_clients": 200
+  },
+  "clients_connected": 200,
+  "registration_seconds": 0.29,
+  "clients_receiving_frames": 200,
+  "frames_per_client": {
+    "total": 1095140,
+    "min": 5458,
+    "p50": 5480,
+    "max": 5486
+  },
+  "time_to_first_frame_s": {
+    "p50": 2.856,
+    "p95": 2.864,
+    "max": 2.909
+  },
+  "client_errors": 0,
+  "first_error": null,
+  "gateway_clients_gauge": {
+    "before": 0.0,
+    "while_connected": 200.0,
+    "after": 0.0
+  },
+  "gateway_rss_mib": {
+    "before": 10.3,
+    "while_connected": 28.6,
+    "after": 28.7
+  },
+  "gateway_rss_growth_mib": 18.3
+}

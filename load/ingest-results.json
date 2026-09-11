@@ -1,0 +1,49 @@
+{
+  "generated_at": "2026-09-11T15:51:29.469Z",
+  "scenario": {
+    "base_url": "http://localhost:8081",
+    "batch": 25,
+    "request_rate_target": 100,
+    "duration": "40s",
+    "offered_events_per_s": 2500,
+    "vehicles": 40,
+    "nfr1_target_events_per_s": 2000
+  },
+  "http_reqs": {
+    "count": 4001,
+    "rate": 99.99557455226544
+  },
+  "http_req_failed": {
+    "rate": 0,
+    "passes": 0,
+    "fails": 4001
+  },
+  "http_req_duration": {
+    "avg": 3.3143766308422933,
+    "min": 0.5737,
+    "med": 2.9299,
+    "max": 39.8599,
+    "p(90)": 4.7107,
+    "p(95)": 5.4177
+  },
+  "events_accepted": {
+    "count": 100025,
+    "rate": 2499.889363806636
+  },
+  "events_rejected": {
+    "count": 0,
+    "rate": 0
+  },
+  "thresholds": {
+    "events_accepted": {
+      "rate>=2000": {
+        "ok": true
+      }
+    },
+    "http_req_failed": {
+      "rate<0.01": {
+        "ok": true
+      }
+    }
+  }
+}
