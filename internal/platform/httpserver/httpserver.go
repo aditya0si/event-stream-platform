@@ -76,6 +76,12 @@ type Server struct {
 	http     *http.Server
 	listener net.Listener
 	proberWG sync.WaitGroup
+
+	// done stops the background prober. A ticker's Stop does not close its channel, so a
+	// `for range t.C` loop never ends on its own — the prober has to be told, or Shutdown
+	// waits on it forever.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // New builds a server. It binds the listener immediately so that a port conflict is a
@@ -89,7 +95,7 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	mux := http.NewServeMux()
-	s := &Server{cfg: cfg}
+	s := &Server{cfg: cfg, done: make(chan struct{})}
 
 	// Liveness. Never checks dependencies — see the package comment.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -157,23 +163,38 @@ func (s *Server) Start() <-chan error {
 
 // probeLoop runs the readiness checks on a timer so dependency gauges stay current even
 // when no probe traffic arrives.
+//
+// It selects on a done channel rather than ranging over the ticker, because a stopped
+// ticker is not a closed channel: ranging would block forever and Shutdown would never
+// return. That is not hypothetical — it is what the first CI run on this repository caught,
+// as a test-timeout panic, and it would equally have made the deployed binary ignore
+// SIGTERM for the whole grace period before being killed.
 func (s *Server) probeLoop() {
 	defer s.proberWG.Done()
 	t := time.NewTicker(s.cfg.ProbeInterval)
 	defer t.Stop()
-	for range t.C {
-		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ProbeTimeout)
-		runChecks(ctx, s.cfg.Checks, s.cfg.ProbeTimeout)
-		cancel()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+			ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ProbeTimeout)
+			runChecks(ctx, s.cfg.Checks, s.cfg.ProbeTimeout)
+			cancel()
+		}
 	}
 }
 
 // Shutdown stops accepting connections and waits for in-flight requests, bounded by the
-// configured timeout. It then stops the prober.
+// configured timeout. It then stops the prober and waits for it to finish.
+//
+// The order matters: the listener closes first, so no new request can start a check that
+// the prober's own stop signal would then race.
 func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(shutdownCtx)
+	s.doneOnce.Do(func() { close(s.done) })
 	s.proberWG.Wait()
 	return err
 }
