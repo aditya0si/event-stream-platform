@@ -5,7 +5,7 @@ Postgres sink, dead-letter handling with replay, and a live browser fan-out over
 
 ## Status
 
-**M5 complete: the live view, and a reconnect that loses nothing.** `docker compose up --build`
+**M6 complete: the delivery guarantees are measured, not asserted.** `docker compose up --build`
 brings up Postgres, Redis, Redpanda, a one-shot migration container, the ingest service, the
 consumer, and the SSE gateway.
 `POST /v1/events` validates a batch, gives each event an identity, and publishes it to
@@ -30,7 +30,7 @@ What exists today, and what does not:
 | `cmd/gateway` — SSE with `Last-Event-ID` resume, a live map viewer at `/`, a per-client buffer that sheds a slow viewer rather than stalling the fan-out, and a 503 + `Retry-After` refusal at its configured client limit | |
 | The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | |
 | Operational surface on every process: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | |
-| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 48 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, that refusal replayed, an event delivered to an already-connected browser over the bus, and a reconnect resuming exactly the missed frames | |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 66 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, that refusal replayed, an event delivered to an already-connected browser over the bus, a reconnect resuming exactly the missed frames, and a consumer killed with `SIGKILL` and then rewound to the start of the log, where every re-delivered event deduplicated instead of being applied twice | |
 
 Three properties are decisions rather than accidents. Ingest **does not deduplicate**: it durably
 records what arrived and lets the consumer's transaction refuse the second effect

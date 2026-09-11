@@ -547,7 +547,159 @@ if ids:
 s, _ = req("/v1/vehicles/smoke-never-seen-" + uuid.uuid4().hex[:8], base=GATEWAY)
 check("  an unknown vehicle is a 404, not a 500", s == 404, f"{s}")
 
+print("\n=== 11. kill the consumer outright: nothing lost, nothing doubled (M6) ===")
+
+# The harshest failure this system claims to survive. SIGKILL gives the process no chance to
+# finish a batch, commit an offset, or drain: whatever it applied but did not commit is
+# redelivered to its replacement, and the deduplication record is what makes that redelivery a
+# no-op rather than a second application.
+#
+# The container has to be the victim. A Go test can cancel a context, but only the deployed
+# stack can have its process killed the way an OOM killer or a cluster eviction kills it.
+chaos_prefix = "chaos-" + uuid.uuid4().hex[:8]
+
+
+def post_chaos(tag, n):
+    """Post one event per synthetic vehicle, returning (status, body, vehicle ids)."""
+    vehicles = [f"{chaos_prefix}-{tag}{i}" for i in range(n)]
+    events = [{
+        "vehicle_id": v, "route_id": "chaos-r1",
+        "lat": 12.90 + i * 0.01, "lon": 77.50 + i * 0.01,
+        "speed_kph": 30.0, "sequence": 1,
+        "event_ts": datetime.now(timezone.utc).isoformat(),
+    } for i, v in enumerate(vehicles)]
+    s, b = post("/v1/events", {"events": events})
+    return s, b, vehicles
+
+
+def consumer_metric(name, label):
+    """Read one labelled counter from the consumer's own metrics port, or None."""
+    try:
+        with urllib.request.urlopen("http://localhost:9091/metrics", timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    for line in text.splitlines():
+        if line.startswith("#") or not line.startswith(name) or label not in line:
+            continue
+        try:
+            return float(line.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+s, b, pre_vehicles = post_chaos("a", 4)
+check("events were flowing before the kill", s == 202, f"{s} {b}")
+
+# Suspend the restart policy first: see the note above. Restored before the container is started.
+ok, out = docker(["update", "--restart=no", "esp-consumer"])
+check("  the restart policy was suspended so the kill sticks", ok, out.strip()[:70])
+
+ok, out = docker(["kill", "esp-consumer"])
+check("  the consumer was killed with SIGKILL (no chance to drain or commit)", ok, out.strip()[:70])
+
+# The window that matters. A consumer that merely restarts quickly proves nothing; what has to
+# hold is that the log keeps accepting events with nothing consuming them, and that the group
+# resumes from its committed offset rather than from the head when it returns.
+s, b, during_vehicles = post_chaos("b", 3)
+check("  events posted while nothing was consuming are accepted", s == 202, f"{s} {b}")
+
+ok, out = docker(["update", "--restart=unless-stopped", "esp-consumer"])
+check("  the restart policy was restored", ok, out.strip()[:70])
+ok, out = docker(["start", "esp-consumer"])
+check("  the consumer was started again", ok, out.strip()[:70])
+
+chaos_vehicles = pre_vehicles + during_vehicles
+expected = len(chaos_vehicles)
+
+# Catch-up. Generous, because a cold consumer re-reads whatever the kill left uncommitted before
+# it reaches the head of the log.
+applied, deadline = 0, time.time() + 120
+while time.time() < deadline:
+    ok, out = psql("SELECT count(*) FROM vehicle_current WHERE vehicle_id LIKE '" + chaos_prefix + "%'")
+    applied = int(out.strip()) if ok and out.strip().isdigit() else 0
+    if applied == expected:
+        break
+    time.sleep(2)
+check("  every event from both phases reached current state", applied == expected,
+      f"{applied}/{expected}")
+
+ok, out = psql("SELECT count(*) FROM vehicle_positions WHERE vehicle_id LIKE '" + chaos_prefix + "%'")
+check("  the history holds exactly one row per event",
+      ok and out.strip() == str(expected),
+      f"{out.strip() if ok else '?'} row(s) for {expected} event(s): a redelivered event must "
+      f"deduplicate, not append a second row")
+
+ok, out = psql("SELECT count(*) FROM dead_letters WHERE encode(raw_payload,'escape') LIKE '%" + chaos_prefix + "%'")
+check("  the restart dead-lettered nothing",
+      ok and out.strip() == "0", f"{out.strip() if ok else '?'} dead letter(s)")
+
+lag, deadline = None, time.time() + 90
+while time.time() < deadline:
+    lag = group_lag("sink-v1", "telemetry.raw.v1")
+    if lag == 0:
+        break
+    time.sleep(2)
+check("  the group caught up to zero lag after the restart", lag == 0, f"lag={lag}")
+
+# Everything above holds whether or not a redelivery actually happened: a kill that lands
+# between two batches satisfies "7 rows for 7 events" without the deduplication path being
+# exercised once. The assertion worth making is the opposite one — force the redelivery and show
+# the row count does not move — so the group is rewound to the start of the log and every record
+# it has already applied is delivered a second time.
+#
+# The consumer is stopped across the seek, and that is a requirement rather than tidiness:
+# franz-go holds each partition's position in memory, so rewinding the coordinator's committed
+# offset underneath a running consumer changes nothing until it restarts.
+# Captured before the rewind, so the assertion after it can be an equality rather than a
+# non-emptiness test: "the count is still this number" is falsifiable, "the count is a number"
+# is not. Nothing is posted between here and the re-read, so the count cannot legitimately move.
+ok, processed_before = psql("SELECT count(*) FROM processed_events")
+check("  the deduplication table count was read before the rewind",
+      ok and processed_before.strip().isdigit(),
+      f"{processed_before.strip() if ok else '?'} record(s)")
+
+ok, out = docker(["stop", "esp-consumer"])
+check("  the consumer was stopped so its in-memory offset cannot mask the rewind",
+      ok, out.strip()[:70])
+
+ok, out = docker(["exec", "esp-redpanda", "rpk", "group", "seek", "sink-v1",
+                  "--to", "start", "--topics", "telemetry.raw.v1"])
+check("  the group was rewound to the start of the log", ok, out.strip()[:80])
+
+ok, out = docker(["start", "esp-consumer"])
+check("  the consumer was started again, and must re-read everything it already applied",
+      ok, out.strip()[:70])
+
+lag, deadline = None, time.time() + 180
+while time.time() < deadline:
+    lag = group_lag("sink-v1", "telemetry.raw.v1")
+    if lag == 0:
+        break
+    time.sleep(3)
+check("  it re-read the whole log and caught up", lag == 0, f"lag={lag}")
+
+ok, out = psql("SELECT count(*) FROM vehicle_positions WHERE vehicle_id LIKE '" + chaos_prefix + "%'")
+check("  the history still holds exactly one row per event",
+      ok and out.strip() == str(expected),
+      f"{out.strip() if ok else '?'} row(s), unchanged — every re-read event deduplicated")
+
+ok, out = psql("SELECT count(*) FROM processed_events")
+check("  the deduplication table did not grow either",
+      ok and out.strip() == processed_before.strip(),
+      f"{out.strip() if ok else '?'} record(s), was {processed_before.strip()} — every re-read "
+      f"event found its existing row instead of inserting a second")
+
+# Read after the rewind, so the number describes a process instance that is still running. A
+# counter from before the kill would be describing a process that no longer exists.
+dups = consumer_metric("consumer_events_total", 'result="duplicate"')
+check("  and the consumer counted the redeliveries it absorbed", (dups or 0) > 0,
+      'consumer_events_total{result="duplicate"} = '
+      + (f"{dups:.0f}" if dups is not None else "absent"))
+
 print("\n=== SUMMARY ===")
+
 passed = sum(1 for _, ok, _ in results if ok)
 print(f"  {passed}/{len(results)} checks passed")
 for label, ok, detail in results:
