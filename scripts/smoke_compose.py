@@ -18,6 +18,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -193,6 +194,61 @@ else:
                       "telemetry.raw.v1", "-o", "start", "--num", str(n), "-f", "%v"], timeout=90)
     check("  the event reached the log", event_id in out,
           f"searched {n} record(s) for the posted event id")
+
+print("\n=== 7. the consumer materializes events into Postgres (M3) ===")
+# The proof that the whole deployed path works: an event posted over HTTP must end up as a
+# row in the sink, which can only happen if the broker carried it AND the consumer service
+# applied it. Asserting on the HTTP reply alone would prove nothing about either.
+consumer_event_id = str(uuid.uuid4())
+consumer_vehicle = "smoke-consumer-" + consumer_event_id[:8]
+s, b = post("/v1/events", {"events": [{
+    "vehicle_id": consumer_vehicle,
+    "route_id": "smoke-r1",
+    "lat": 12.9716,
+    "lon": 77.5946,
+    "speed_kph": 21.5,
+    "event_ts": datetime.now(timezone.utc).isoformat(),
+    "sequence": 1,
+    "event_id": consumer_event_id,
+}]})
+check("POST /v1/events answers 202", s == 202, f"{s} {b}")
+
+# Poll rather than sleep: the consumer is a separate process on a poll loop, so the row
+# appears asynchronously. A fixed sleep would either be too short (a flaky failure on a slow
+# runner) or too long (a slow gate); polling is bounded and finishes as soon as the row lands.
+def psql(sql, timeout=20):
+    ok, out = docker(["exec", "esp-postgres", "psql", "-U", "esp", "-d", "event_stream",
+                      "-tAc", sql], timeout=timeout)
+    return ok, out.strip()
+
+applied = None
+deadline = time.time() + 60
+while time.time() < deadline:
+    ok, out = psql(f"SELECT count(*) FROM vehicle_positions WHERE event_id = '{consumer_event_id}'")
+    if ok and out == "1":
+        applied = True
+        break
+    if ok and out not in ("0", ""):
+        applied = out  # something unexpected: surface it rather than looping
+        break
+    time.sleep(1)
+if applied is None:
+    applied = "0"
+
+check("the consumer applied the event to vehicle_positions", applied is True,
+      f"count={applied!r} after 60s")
+
+# The current-state row is written in the same transaction, so it must agree. Checking both
+# is what distinguishes "the consumer ran" from "the consumer ran the code path I think it did".
+if applied is True:
+    ok, out = psql(f"SELECT last_event_id FROM vehicle_current WHERE vehicle_id = '{consumer_vehicle}'")
+    check("  vehicle_current names the same event", ok and out == consumer_event_id, out or "(no row)")
+
+# And the dedup record exists, which is what makes a redelivery a no-op rather than a
+# second application.
+if applied is True:
+    ok, out = psql(f"SELECT count(*) FROM processed_events WHERE event_id = '{consumer_event_id}'")
+    check("  the deduplication record exists", ok and out == "1", f"count={out}")
 
 print("\n=== SUMMARY ===")
 passed = sum(1 for _, ok, _ in results if ok)

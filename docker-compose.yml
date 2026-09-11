@@ -152,6 +152,53 @@ services:
       retries: 5
       start_period: 10s
 
+  # The consumer group member: it reads the log, applies events to Postgres, and commits
+  # offsets only after the transaction that applied them commits.
+  #
+  # This service is not optional, and its absence is the failure worth naming: without it the
+  # ingest endpoint accepts events, the log fills, and Postgres stays empty. The system would
+  # look healthy from every other angle — topics growing, readiness green — while nothing a
+  # reviewer queried actually existed.
+  #
+  # Metrics and readiness on their own port, because the consumer has no public API. In
+  # production this listener stays on the internal network: consumer lag is operational data.
+  consumer:
+    build: .
+    container_name: esp-consumer
+    entrypoint: ["/bin/consumer"]
+    ports:
+      - "9091:9091"
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://esp:esp@postgres:5432/event_stream?sslmode=disable
+      BROKER_SEEDS: redpanda:9092
+      BROKER_RAW_TOPIC: telemetry.raw.v1
+      BROKER_DLQ_TOPIC: telemetry.dlq.v1
+      CONSUMER_GROUP: sink-v1
+      CONSUMER_METRICS_ADDR: ":9091"
+      CONSUMER_BATCH_SIZE: "200"
+      CONSUMER_MAX_RETRIES: "5"
+      CONSUMER_RETRY_BACKOFF_BASE: 250ms
+      CONSUMER_RETRY_BACKOFF_MAX: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # The healthcheck asks the database and the broker, not just the process: a consumer whose
+    # connection is gone cannot apply anything, and reporting it healthy would hide a log that
+    # is filling while the sink stands still.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9091/readyz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
 volumes:
   esp_pgdata:
   esp_redisdata:

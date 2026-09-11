@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/aditya0si/event-stream-platform/internal/event"
@@ -37,55 +36,6 @@ import (
 // broker itself, and asking this module's own wrapper whether the wrapper worked would prove
 // nothing about the partition a record actually reached.
 
-// testTopic creates a uniquely-named topic and removes it when the test ends.
-//
-// It manages its own clients rather than borrowing one from the caller, and that is not
-// tidiness. The first version took the caller's client and registered the delete with
-// t.Cleanup — which runs *after* the test body's deferred Close, so every delete was attempted
-// against a closed client, failed, and was swallowed by a t.Logf. The tell was three
-// telemetry.test.* topics accumulating in the broker; the code looked correct at every line.
-func testTopic(t *testing.T, seeds []string, partitions int) string {
-	t.Helper()
-
-	name := "telemetry.test." + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	admin, err := broker.NewClient(ctx, broker.Options{SeedBrokers: seeds, ClientID: "esp-test-admin"})
-	if err != nil {
-		t.Fatalf("connect to broker at %v: %v", seeds, err)
-	}
-	defer admin.Close()
-
-	if _, err := broker.EnsureTopics(ctx, admin, []broker.TopicSpec{
-		{Name: name, Partitions: partitions, Retention: time.Hour},
-	}); err != nil {
-		t.Fatalf("create test topic %s: %v", name, err)
-	}
-
-	t.Cleanup(func() {
-		// A separate context *and* a separate client: the test's own context is cancelled by
-		// the time cleanup runs, and any client the test body owns may already be closed.
-		dctx, dcancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer dcancel()
-
-		cleanup, err := broker.NewClient(dctx, broker.Options{SeedBrokers: seeds, ClientID: "esp-test-cleanup"})
-		if err != nil {
-			t.Logf("cleanup could not reach the broker to delete %s: %v", name, err)
-			return
-		}
-		defer cleanup.Close()
-
-		if _, err := kadm.NewClient(cleanup).DeleteTopics(dctx, name); err != nil {
-			t.Logf("could not delete test topic %s: %v", name, err)
-			return
-		}
-		t.Logf("removed test topic %s", name)
-	})
-	return name
-}
-
 // TestIngest_LandsOnTheBrokerWithTheVehicleAsKey is the integration test behind ADR-005.
 //
 // The ordering guarantee is only true if every event for one vehicle lands on one partition.
@@ -100,7 +50,7 @@ func TestIngest_LandsOnTheBrokerWithTheVehicleAsKey(t *testing.T) {
 	defer cancel()
 
 	const partitions = 3
-	topic := testTopic(t, seeds, partitions)
+	topic := testsupport.CreateTopic(t, seeds, "telemetry.test", partitions)
 
 	producer, err := broker.NewProducer(ctx, broker.Options{SeedBrokers: seeds, ClientID: "esp-test-producer"})
 	if err != nil {
