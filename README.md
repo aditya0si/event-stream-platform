@@ -3,15 +3,48 @@
 An event-driven telemetry pipeline in Go: a partitioned log, idempotent consumers, a durable
 Postgres sink, dead-letter handling with replay, and a live browser fan-out over SSE.
 
-**Status: design phase.** The design and its decisions are committed; the implementation has not
-started. [`docs/DESIGN.md`](docs/DESIGN.md) states the requirements, architecture, data model, event
-flows, and failure table, and [`docs/adr/`](docs/adr/) records the nine decisions behind them.
+## Status
 
-There is no `cmd/` and no `internal/` yet, and this README will not claim otherwise. It will be
-replaced with measured numbers — throughput, end-to-end latency, fan-out capacity, and the caveats
-that belong beside them — only once those numbers have actually been measured, in the same way its
-sibling repository [`tenant-api-platform`](https://github.com/aditya0si/tenant-api-platform) reports
-its own.
+**M1 complete: the stack runs.** `docker compose up --build` brings up Postgres, Redis, Redpanda,
+a one-shot migration container, and the ingest service; the migration applies the schema and creates
+both topics with the partition counts the design requires (6 and 3, asserted rather than assumed).
+
+What exists today, and what does not:
+
+| Working now | Not yet |
+|---|---|
+| `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | `cmd/consumer` — the consumer group (M3) |
+| `cmd/ingest` — operational surface: `/healthz`, `/readyz`, `/metrics` | `/v1/events` — the ingest endpoint itself (M2) |
+| The event envelope and its schema versioning | `cmd/replay` — dead-letter inspection (M4) |
+| Dependency health as metrics (`db_up`, `redis_up`, `broker_up`), kept fresh by a background prober | `cmd/gateway` — SSE fan-out and the viewer (M5) |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the suite, a build, and a job that starts the whole stack and smoke-tests it | Any benchmark number, which is why none appears below |
+
+The design documents came first: [`docs/DESIGN.md`](docs/DESIGN.md) states the requirements,
+architecture, data model, event flows, failure table, and explicit non-goals, and
+[`docs/adr/`](docs/adr/) records the nine decisions behind them. This README will carry measured
+numbers — throughput, end-to-end latency, fan-out capacity, and the caveats that belong beside
+them — only once they have actually been measured, in the same way its sibling repository
+[`tenant-api-platform`](https://github.com/aditya0si/tenant-api-platform) reports its own.
+
+## Running it
+
+```bash
+docker compose up --build
+```
+
+That is the whole setup. Ports are offset from the sibling project so both stacks can run at once:
+Postgres `5433`, Redis `6380`, Redpanda `19092` (external Kafka listener), ingest `8081`.
+
+Against dependencies you already run:
+
+```bash
+go run ./cmd/migrate all            # schema + topics; idempotent
+go run ./cmd/migrate status         # what is applied, what is pending
+go run ./cmd/ingest                 # DATABASE_URL is required; everything else has a default
+```
+
+`make` targets wrap the same commands, and the raw commands above are listed in the Makefile for
+hosts without it. [`.env.example`](.env.example) documents every variable.
 
 ## What it will be
 

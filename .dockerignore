@@ -1,0 +1,32 @@
+# Keep the build context small and the image reproducible: the module cache and build
+# output do not belong in a container whose source is fetched by `go mod download`.
+
+.git
+.gitignore
+
+# Build output and binaries.
+bin/
+*.exe
+*.test
+*.out
+
+# Local artifacts that must never reach an image.
+.env
+.env.*
+!.env.example
+*.log
+coverage.out
+coverage.html
+
+# Documentation and CI config are not needed at runtime.
+docs/
+.github/
+Makefile
+README.md
+LICENSE
+
+# Editor and OS noise.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

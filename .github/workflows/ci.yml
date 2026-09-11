@@ -1,0 +1,151 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # The reference run for code quality: formatting, static analysis, the migrations against a
+  # real Postgres and a real broker, the suite, and a build.
+  #
+  # Postgres and Redis are declared as service containers; Redpanda is started with `docker
+  # run` because it needs a custom command line (single-core, 1G, external listener) that the
+  # services block cannot express.
+  go:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: esp
+          POSTGRES_PASSWORD: esp
+          POSTGRES_DB: event_stream_test
+        ports:
+          - 5433:5432
+        # Without a readiness probe the first migration races the server's start-up and the
+        # job fails intermittently.
+        options: >-
+          --health-cmd "pg_isready -U esp -d event_stream_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://esp:esp@localhost:5433/event_stream_test?sslmode=disable
+      TEST_DATABASE_URL: postgres://esp:esp@localhost:5433/event_stream_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6380/1
+      TEST_BROKER_SEEDS: localhost:19092
+      BROKER_SEEDS: localhost:19092
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # Redpanda is started before the migrations because `migrate all` ensures the topics
+      # exist as well as applying the schema.
+      - name: start redpanda
+        run: |
+          docker run -d --name redpanda \
+            -p 19092:19092 \
+            redpandadata/redpanda:v26.2.2 \
+            redpanda start --smp=1 --memory=1G --overprovisioned --node-id=0 --check=false \
+              --kafka-addr=PLAINTEXT://0.0.0.0:19092 \
+              --advertise-kafka-addr=PLAINTEXT://localhost:19092
+
+      - name: wait for redpanda
+        run: |
+          # rpk v26.2.2 has no --quiet flag on `cluster health` (verified against the pinned
+          # image: it exits 1 with "unknown flag"). The text output is matched instead.
+          # --exit-when-healthy would also work, but it blocks while the cluster is unhealthy,
+          # which makes it the wrong primitive for a bounded retry loop.
+          for i in $(seq 1 30); do
+            if docker exec redpanda rpk cluster health 2>/dev/null | grep -qE 'Healthy:[[:space:]]+true'; then
+              echo "redpanda healthy after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::redpanda did not become healthy"
+          docker logs redpanda
+          exit 1
+
+      - name: migrate
+        run: go run ./cmd/migrate all
+
+      # The tests run against a real Postgres, a real Redis, and a real broker. They fail
+      # rather than skip when a dependency is missing, so a green run here is evidence the
+      # wiring works — see NFR-9.
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+      - name: build
+        run: go build ./...
+
+  # `docker compose config` proves the file parses; the smoke job below proves the stack
+  # actually starts. Both are kept because they fail differently and are cheap.
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config
+
+  # The stack is built, started, and exercised. This is the job that would have caught the
+  # defects a unit suite cannot see on this project's sibling — a wrong entrypoint, a container
+  # that cannot resolve a service name, a topic created with the wrong partition count, or a
+  # control that works in a harness but not in the running binary.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: start the stack
+        run: docker compose up -d --build
+
+      - name: wait for ingest to be ready
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/readyz || true)
+            if [ "$code" = "200" ]; then
+              echo "ingest ready after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::ingest did not become ready within 120s"
+          docker compose ps
+          docker compose logs
+          exit 1
+
+      - name: smoke test (the deployed path)
+        run: python3 scripts/smoke_compose.py
+
+      - name: stack logs
+        if: failure()
+        run: docker compose logs --no-color

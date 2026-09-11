@@ -1,0 +1,158 @@
+# event-stream-platform — local stack.
+#
+# Everything a reviewer needs runs here: two databases, the broker, the one-shot migration
+# step, and the ingest service. `docker compose up --build` is the whole setup.
+#
+# Ports are deliberately offset from the sibling project (tenant-api-platform) so both
+# stacks can run at once without one clobbering the other:
+#
+#   postgres   5433   (sibling uses 5432)
+#   redis      6380   (sibling uses 6379)
+#   redpanda  19092   (external Kafka listener; containers use redpanda:9092)
+#   ingest     8081   (sibling's API uses 8080)
+#   consumer   9091   (metrics/health; sibling's worker uses 9090)
+#   gateway    8082
+#
+# Redpanda exposes two Kafka listeners on purpose: `internal` is what containers dial, and
+# `external` is what a binary running on the host dials. The advertised addresses differ
+# per listener — a single listener cannot serve both, because the broker hands clients the
+# address they must reconnect to, and "localhost" means something different inside a
+# container than outside one.
+
+name: event-stream-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: esp-postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: esp
+      POSTGRES_PASSWORD: esp
+      POSTGRES_DB: event_stream
+    volumes:
+      - esp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U esp -d event_stream"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: esp-redis
+    ports:
+      - "6380:6379"
+    # Append-only persistence is enabled even though the fan-out bus is best-effort
+    # (ADR-009): the channel is not the durable record, but a restart mid-demo should not
+    # look like a bug.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - esp_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redpanda:
+    image: redpandadata/redpanda:v26.2.2
+    container_name: esp-redpanda
+    command:
+      - redpanda
+      - start
+      # One core and 1G: this broker is a portfolio-sized deployment, not a cluster, and
+      # the resource ceiling is stated rather than hidden. --overprovisioned tells Redpanda
+      # it does not own the machine, which is true in a shared Docker VM.
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      # Two listeners: internal for containers, external for host-run binaries.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - esp_redpandadata:/var/lib/redpanda/data
+    # The healthcheck asks the broker whether it considers itself healthy, rather than
+    # merely whether the port is open. A Redpanda node that has bound its listener but not
+    # yet formed a cluster answers TCP and fails metadata requests, which is exactly the
+    # window in which `migrate` would fail if the two were conflated.
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # Applies the schema and ensures the topics exist, then exits. The ingest service waits
+  # for this to complete so a fresh `compose up` never serves traffic against a schema
+  # that does not exist yet.
+  #
+  # entrypoint is overridden because the image's default entrypoint is /bin/ingest;
+  # without this, `command` would be passed to the ingest binary as arguments.
+  migrate:
+    build: .
+    container_name: esp-migrate
+    entrypoint: ["/bin/migrate", "all"]
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://esp:esp@postgres:5432/event_stream?sslmode=disable
+      BROKER_SEEDS: redpanda:9092
+      BROKER_RAW_TOPIC: telemetry.raw.v1
+      BROKER_DLQ_TOPIC: telemetry.dlq.v1
+      BROKER_RAW_PARTITIONS: "6"
+      BROKER_DLQ_PARTITIONS: "3"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+
+  ingest:
+    build: .
+    container_name: esp-ingest
+    ports:
+      - "8081:8081"
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://esp:esp@postgres:5432/event_stream?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      # Internal listener: this process runs inside the compose network.
+      BROKER_SEEDS: redpanda:9092
+      INGEST_ADDR: ":8081"
+      # No API key in dev; the config refuses to boot without one when APP_ENV=prod.
+      INGEST_API_KEY: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8081/readyz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  esp_pgdata:
+  esp_redisdata:
+  esp_redpandadata:
