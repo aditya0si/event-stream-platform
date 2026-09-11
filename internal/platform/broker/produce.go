@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -11,9 +12,7 @@ import (
 // Record is one message to publish.
 //
 // It is this package's own type rather than a *kgo.Record so that callers do not import the
-// client library, and so the fields that matter here are the only ones on offer. Headers are
-// absent deliberately: the only current use for record headers is replay metadata (M4), and
-// adding the field now would invite a caller to set one that nothing reads.
+// client library, and so the fields that matter here are the only ones on offer.
 type Record struct {
 	// Key decides the partition. Records with the same key land on the same partition in
 	// the order they were produced, which is the entire basis of the per-vehicle ordering
@@ -21,6 +20,15 @@ type Record struct {
 	Key string
 	// Value is the serialized envelope.
 	Value []byte
+	// Headers travel beside the payload. Kafka does not interpret them: they exist for
+	// producers and consumers to annotate a record, and the one current use is replay
+	// provenance (cmd/replay marks what it put back and where the record came from).
+	//
+	// A map rather than a slice because a caller sets named facts, not an ordered list, and
+	// duplicate keys would be a bug rather than a feature. The conversion to the wire
+	// representation sorts by key so that a produced record is byte-identical across runs,
+	// which matters when a test compares them.
+	Headers map[string]string
 }
 
 // Producer publishes records.
@@ -69,11 +77,24 @@ func (p *Producer) Produce(ctx context.Context, topic string, recs []Record) err
 
 	krs := make([]*kgo.Record, 0, len(recs))
 	for _, r := range recs {
-		krs = append(krs, &kgo.Record{
+		kr := &kgo.Record{
 			Topic: topic,
 			Key:   []byte(r.Key),
 			Value: r.Value,
-		})
+		}
+		if len(r.Headers) > 0 {
+			// Sorted, so the same logical record produces the same bytes on every call.
+			keys := make([]string, 0, len(r.Headers))
+			for k := range r.Headers {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			kr.Headers = make([]kgo.RecordHeader, 0, len(keys))
+			for _, k := range keys {
+				kr.Headers = append(kr.Headers, kgo.RecordHeader{Key: k, Value: []byte(r.Headers[k])})
+			}
+		}
+		krs = append(krs, kr)
 	}
 
 	results := p.cl.ProduceSync(ctx, krs...)

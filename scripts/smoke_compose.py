@@ -97,6 +97,64 @@ def docker(args, timeout=30):
     return p.returncode == 0, (p.stdout + p.stderr).strip()
 
 
+def docker_stdin(args, data, timeout=60):
+    """Run a docker command with data on stdin (rpk topic produce needs it).
+
+    `data` may be bytes: the payload here is often deliberately not valid UTF-8 text, and the
+    caller should not have to think about that. It is decoded for the pipe because this function
+    runs subprocess in text mode (the reply is parsed as text), and text mode requires a str on
+    stdin — passing bytes is a TypeError, which is exactly how the first version of this
+    function failed.
+    """
+    if isinstance(data, (bytes, bytearray)):
+        data = bytes(data).decode("utf-8", errors="replace")
+    p = subprocess.run(["docker", *args], input=data, capture_output=True,
+                       encoding="utf-8", errors="replace", timeout=timeout)
+    return p.returncode == 0, (p.stdout + p.stderr).strip()
+
+
+def group_lag(group, topic):
+    """Total consumer lag for a group on one topic, or None when it cannot be read.
+
+    Lag is the only honest way to assert "the consumer did not stall": it is the broker's own
+    count of records the group has not committed, so zero means every record — including any
+    the consumer refused — has been dealt with.
+
+    The LAG column's position is read from the header rather than hardcoded, because the first
+    version of this function hardcoded it and was silently wrong: it assumed a five-column row
+    and therefore summed LOG-END-OFFSET instead, reporting lag=10 for a group whose own
+    TOTAL-LAG line — printed by rpk itself, in the same output — read 0. A monitor that invents
+    a column layout reports an outage that is not happening, which is worse than reporting
+    nothing. (The other parser in this file, for `rpk topic describe`, already read its header;
+    this one did not.)
+    """
+    ok, out = docker(["exec", "esp-redpanda", "rpk", "group", "describe", group], timeout=45)
+    if not ok:
+        return None
+
+    lag_col = None
+    total = 0
+    saw_row = False
+    for line in out.splitlines():
+        parts = line.split()
+        if lag_col is None:
+            # Everything above the per-partition table is the group summary; this is the header.
+            if "TOPIC" in parts and "LAG" in parts:
+                lag_col = parts.index("LAG")
+            continue
+        if len(parts) <= lag_col or parts[0] != topic:
+            continue
+        # A dash means "no committed offset and nothing to lag behind" — a partition that has
+        # never received a record. It contributes nothing, and parsing it as a number would be
+        # a crash rather than a wrong answer.
+        if parts[lag_col] == "-":
+            continue
+        if re.fullmatch(r"-?\d+", parts[lag_col]):
+            saw_row = True
+            total += max(0, int(parts[lag_col]))
+    return total if saw_row else None
+
+
 print("=== 1. the stack is up ===")
 ok, out = docker(["compose", "ps", "--format", "{{.Name}} {{.Status}}"])
 for line in out.splitlines():
@@ -249,6 +307,78 @@ if applied is True:
 if applied is True:
     ok, out = psql(f"SELECT count(*) FROM processed_events WHERE event_id = '{consumer_event_id}'")
     check("  the deduplication record exists", ok and out == "1", f"count={out}")
+
+print("\n=== 8. a record that cannot be decoded is refused without stalling the stream (M4) ===")
+# Published straight to the log rather than through POST /v1/events, and that is the point: the
+# handler validates and rejects malformed events, so an undecodable record can only reach the
+# log from a producer that bypassed validation — which is exactly the case the dead-letter path
+# exists for.
+poison_marker = "poison-" + uuid.uuid4().hex[:12]
+# The trailing newline is required, not cosmetic: `rpk topic produce` reads one record per line
+# from stdin, and a payload that ends without one produces "record read error: unexpected EOF".
+poison_bytes = ("{not valid json, marker " + poison_marker + "\n").encode()
+ok, out = docker_stdin(["exec", "-i", "esp-redpanda", "rpk", "topic", "produce",
+                        "telemetry.raw.v1", "-k", "poison-vehicle"], poison_bytes, timeout=60)
+check("a poison record was published straight to the log", ok, out.splitlines()[-1] if out else "")
+
+# A healthy event after it, so "the consumer kept moving" is a statement about a record that
+# followed the poison one rather than about a system that happened to be quiet.
+healthy_id = str(uuid.uuid4())
+healthy_vehicle = "smoke-after-poison-" + healthy_id[:8]
+s, b = post("/v1/events", {"events": [{
+    "vehicle_id": healthy_vehicle, "route_id": "smoke-r1",
+    "lat": 13.0001, "lon": 77.6001, "speed_kph": 18.0,
+    "event_ts": datetime.now(timezone.utc).isoformat(), "sequence": 1, "event_id": healthy_id,
+}]})
+check("  a healthy event follows it", s == 202, f"{s} {b}")
+
+# Drain to zero lag: the broker's own measure that every record on every partition has been
+# dealt with, refused ones included.
+lag = None
+deadline = time.time() + 90
+while time.time() < deadline:
+    lag = group_lag("sink-v1", "telemetry.raw.v1")
+    if lag == 0:
+        break
+    time.sleep(2)
+check("  the consumer group drains to zero lag", lag == 0, f"lag={lag}")
+
+ok, out = psql(f"""SELECT event_id || '|' || reason FROM dead_letters
+                   WHERE encode(raw_payload, 'escape') LIKE '%{poison_marker}%'
+                   ORDER BY last_failed_at DESC LIMIT 1""")
+poison_event_id = ""
+if ok and "|" in out:
+    poison_event_id, _, poison_reason = out.partition("|")
+    check("  the refusal was recorded with reason 'decode'", poison_reason.strip() == "decode", out)
+else:
+    check("  the refusal was recorded", False, out or "(no row: the poison record vanished)")
+
+ok, out = psql(f"SELECT count(*) FROM vehicle_positions WHERE event_id = '{healthy_id}'")
+check("  the healthy event was still applied", ok and out == "1",
+      f"count={out}: a poison record must not block the events behind it")
+
+print("\n=== 9. an operator can replay a refusal through the same image (M4) ===")
+if not poison_event_id:
+    check("replay CLI", False, "no poison row to replay (section 8 failed)")
+else:
+    ok, out = docker(["compose", "run", "--rm", "replay", "replay", "--event-id", poison_event_id],
+                     timeout=120)
+    check("`replay replay --event-id` exits 0", ok, out.splitlines()[-1] if out else "")
+    check("  it reports the republish", "republished" in out, out[-200:] if out else "")
+
+    # The republished record must be on the log with its provenance. This is the durable proof
+    # that replay put the *original bytes* back rather than writing an effect itself.
+    #
+    # The format is `%h{ ... }` rather than a bare `%h`: this rpk version requires a modifier
+    # block for headers and refuses to run without one (verified against the pinned image).
+    n = broker_message_count("telemetry.raw.v1") or 0
+    ok, out = docker(["exec", "esp-redpanda", "timeout", "45", "rpk", "topic", "consume",
+                      "telemetry.raw.v1", "-o", "start", "--num", str(n),
+                      "-f", "%h{ %k=%v }|%v"], timeout=90)
+    check("  the replayed record carries x-replay provenance", "x-replay" in out,
+          f"searched {n} record(s)")
+    check("  and the original bytes came back unchanged", poison_marker in out,
+          "the marker from the refused payload was found in the log again")
 
 print("\n=== SUMMARY ===")
 passed = sum(1 for _, ok, _ in results if ok)

@@ -199,6 +199,32 @@ services:
       retries: 5
       start_period: 10s
 
+  # The operator's replay CLI, as a one-off container.
+  #
+  # It is under a profile so `docker compose up` does not start it: a CLI that runs, prints, and
+  # exits would sit there restarting and look like a crash loop. Naming it explicitly still
+  # works (`docker compose run --rm replay ...`), because targeting a service enables its
+  # profile.
+  #
+  # It runs the same image as everything else (ADR-007), so the tool an operator reaches for
+  # during an incident is built from the same commit as the consumer whose refusals it reads.
+  replay:
+    build: .
+    entrypoint: ["/bin/replay"]
+    profiles: ["tools"]
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://esp:esp@postgres:5432/event_stream?sslmode=disable
+      BROKER_SEEDS: redpanda:9092
+      BROKER_RAW_TOPIC: telemetry.raw.v1
+      BROKER_DLQ_TOPIC: telemetry.dlq.v1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+
 volumes:
   esp_pgdata:
   esp_redisdata:

@@ -42,6 +42,12 @@ func newStore(t *testing.T) (*sink.Store, *pgxpool.Pool) {
 	}
 	t.Cleanup(pool.Close)
 
+	// The dead-letter queue is shared state, and this package asserts on its depth as a whole
+	// number. Other packages' tests run in parallel against the same database, so those
+	// assertions are only meaningful while holding a cross-process lock — see
+	// testsupport.LockDLQ, and the failure that prompted it.
+	testsupport.LockDLQ(t, pool)
+
 	st, err := sink.NewStore(pool, "test-consumer/1")
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)

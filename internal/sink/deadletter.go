@@ -69,7 +69,14 @@ func (s *Store) RecordDeadLetter(ctx context.Context, dl DeadLetter) error {
 				error          = EXCLUDED.error,
 				reason         = EXCLUDED.reason,
 				attempts       = dead_letters.attempts + EXCLUDED.attempts,
-				last_failed_at = now()`,
+				last_failed_at = now(),
+				-- A refusal that arrives for an event already marked 'replayed' means the
+				-- replay did not fix it: the event is awaiting attention again. Resetting the
+				-- state here is what stops a replayed-then-failed event from reporting as
+				-- 'replayed' forever — a queue that looks handled while nobody is watching it.
+				-- The two columns move together because the CHECK constraint requires it.
+				state          = 'dead',
+				replayed_at    = NULL`,
 			dl.EventID, dl.Payload, dl.Error, dl.Reason, dl.Attempts,
 			first, dl.Topic, dl.Partition, dl.Offset)
 		if err != nil {
