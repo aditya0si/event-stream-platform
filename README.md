@@ -71,6 +71,15 @@ went through one ingest process and one three-node-replica-free broker; the fan-
 1,000 clients is untested; and the end-to-end figure holds at an offered rate far below the
 ingest ceiling, which is the condition under which a latency number means anything.
 
+**Test coverage: 45.5% of statements**, measured with `go test -covermode=atomic
+-coverprofile=... ./...` against the same real Postgres, Redis and broker the suite requires.
+What it says is which packages carry their weight: `httpserver` 96.2%, `config` 94.8%, `ingest`
+89.5%, `gateway` 84.8%, `idgen` 83.3% and `simulator` 80.2% are where a change is likely to break
+something subtle. The packages reading 0% are the wiring — `cmd/*` are `main` functions there is
+no unit to test, and `reqid` and `testsupport` are exercised by the deployed smoke suite rather
+than by the Go tests. One number hides that split, which is why it is stated rather than left in
+a badge.
+
 Three properties are decisions rather than accidents. Ingest **does not deduplicate**: it durably
 records what arrived and lets the consumer's transaction refuse the second effect
 ([ADR-006](docs/adr/ADR-006-dedup-store.md)), because a dedupe cache at this layer would be a
