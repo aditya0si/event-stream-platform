@@ -31,7 +31,7 @@ What exists today, and what does not:
 | `cmd/gateway` — SSE with `Last-Event-ID` resume, a live map viewer at `/`, a per-client buffer that sheds a slow viewer rather than stalling the fan-out, and a 503 + `Retry-After` refusal at its configured client limit | |
 | The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | |
 | Operational surface on every process: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | |
-| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 66 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, that refusal replayed, an event delivered to an already-connected browser over the bus, a reconnect resuming exactly the missed frames, and a consumer killed with `SIGKILL` and then rewound to the start of the log, where every re-delivered event deduplicated instead of being applied twice | |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 75 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, that refusal replayed, an event delivered to an already-connected browser over the bus, a reconnect resuming exactly the missed frames, and a consumer killed with `SIGKILL` and then rewound to the start of the log, where every re-delivered event deduplicated instead of being applied twice | |
 
 ## Measured
 
@@ -83,10 +83,10 @@ append-only, while the map it drives cannot move backwards.
 
 The design documents came first: [`docs/DESIGN.md`](docs/DESIGN.md) states the requirements,
 architecture, data model, event flows, failure table, and explicit non-goals, and
-[`docs/adr/`](docs/adr/) records the nine decisions behind them. This README will carry measured
-numbers — throughput, end-to-end latency, fan-out capacity, and the caveats that belong beside
-them — only once they have actually been measured, in the same way its sibling repository
-[`tenant-api-platform`](https://github.com/aditya0si/tenant-api-platform) reports its own.
+[`docs/adr/`](docs/adr/) records the nine decisions behind them. The numbers above came after, and
+each is published with the method that produced it and the conditions it holds under — the same
+discipline its sibling repository
+[`tenant-api-platform`](https://github.com/aditya0si/tenant-api-platform) applies to its own.
 
 ## Running it
 
@@ -113,12 +113,12 @@ hosts without it. [`.env.example`](.env.example) documents every variable.
 
 ## Component map
 
-Every row is implemented and running except the source, which is marked: the benchmark milestone
-drives the system with `cmd/simulate` rather than by hand.
+Every row is implemented and running. `docker compose up --build` starts the service, and
+`docker compose --profile demo up -d simulate` adds the fleet the viewer draws.
 
 | Stage | Component |
 |---|---|
-| Source | `cmd/simulate` — a deterministic fleet telemetry producer over committed route geometry (M7, not yet) |
+| Source | `cmd/simulate` — a deterministic fleet telemetry producer over committed route geometry |
 | Ingest | `cmd/ingest` — HTTP batch endpoint with validation and an OpenAPI contract |
 | Log | Redpanda (`telemetry.raw.v1`, partitioned by vehicle) |
 | Processing | `cmd/consumer` — a consumer group with idempotent, deduplicated processing |
