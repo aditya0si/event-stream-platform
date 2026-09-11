@@ -5,25 +5,28 @@ Postgres sink, dead-letter handling with replay, and a live browser fan-out over
 
 ## Status
 
-**M3 complete: events flow end to end and land in Postgres.** `docker compose up --build` brings up
+**M4 complete: a refused event is recoverable, not lost.** `docker compose up --build` brings up
 Postgres, Redis, Redpanda, a one-shot migration container, the ingest service, and the consumer.
 `POST /v1/events` validates a batch, gives each event an identity, and publishes it to
 `telemetry.raw.v1` **keyed by vehicle** — so one vehicle's events share a partition in produce
 order, which is what the per-vehicle ordering guarantee
-([ADR-005](docs/adr/ADR-005-ordering-and-late-data.md)) actually rests on. A consumer group then
-reads that log, applies each event to Postgres exactly once, and commits its offsets only after the
-transaction that applied them has committed.
+([ADR-005](docs/adr/ADR-005-ordering-and-late-data.md)) actually rests on. A consumer group reads
+that log, applies each event to Postgres exactly once, commits its offsets only after the
+transaction that applied them has committed, and records what it cannot apply in two places: a row
+an operator can query, and a copy on `telemetry.dlq.v1` that survives the queryable store being
+unavailable. `cmd/replay` puts a refusal back on the log it came from.
 
 What exists today, and what does not:
 
 | Working now | Not yet |
 |---|---|
-| `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | `cmd/replay` — dead-letter inspection and replay (M4) |
-| `POST /v1/events` — batch validation, per-event rejection with the offending field, and 503 + `Retry-After` when the log is unreachable | `cmd/gateway` — SSE fan-out and the viewer (M5) |
-| `cmd/consumer` — a consumer group that deduplicates in the same transaction as its effects, keeps every observation in history while refusing to move current state backwards, and dead-letters what it cannot apply | `cmd/simulate` — the deterministic fleet producer the benchmarks will drive (M7) |
-| The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | Any benchmark number, which is why none appears below |
+| `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | `cmd/gateway` — SSE fan-out and the viewer (M5) |
+| `POST /v1/events` — batch validation, per-event rejection with the offending field, and 503 + `Retry-After` when the log is unreachable | `cmd/simulate` — the deterministic fleet producer the benchmarks will drive (M7) |
+| `cmd/consumer` — a consumer group that deduplicates in the same transaction as its effects, keeps every observation in history while refusing to move current state backwards, and dead-letters what it cannot apply | Any benchmark number, which is why none appears below |
+| `cmd/replay` — `list`, `show`, and `replay`, republishing an event's original bytes with provenance headers so the ordinary consumer processes it and the same deduplication guarantee applies | |
+| The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | |
 | Operational surface on both processes: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | |
-| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 24 checks, including a posted event read back off the broker *and* applied to Postgres by the consumer | |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 33 checks, including a posted event applied to Postgres by the consumer, a record that cannot be decoded refused without stalling the stream, and that same refusal replayed | |
 
 Three properties are decisions rather than accidents. Ingest **does not deduplicate**: it durably
 records what arrived and lets the consumer's transaction refuse the second effect
