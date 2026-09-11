@@ -5,29 +5,35 @@ Postgres sink, dead-letter handling with replay, and a live browser fan-out over
 
 ## Status
 
-**M2 complete: events are ingested and durable in the log.** `docker compose up --build` brings up
-Postgres, Redis, Redpanda, a one-shot migration container, and the ingest service. `POST /v1/events`
-validates a batch of observations, gives each event an identity, and publishes it to
+**M3 complete: events flow end to end and land in Postgres.** `docker compose up --build` brings up
+Postgres, Redis, Redpanda, a one-shot migration container, the ingest service, and the consumer.
+`POST /v1/events` validates a batch, gives each event an identity, and publishes it to
 `telemetry.raw.v1` **keyed by vehicle** — so one vehicle's events share a partition in produce
 order, which is what the per-vehicle ordering guarantee
-([ADR-005](docs/adr/ADR-005-ordering-and-late-data.md)) actually rests on.
+([ADR-005](docs/adr/ADR-005-ordering-and-late-data.md)) actually rests on. A consumer group then
+reads that log, applies each event to Postgres exactly once, and commits its offsets only after the
+transaction that applied them has committed.
 
 What exists today, and what does not:
 
 | Working now | Not yet |
 |---|---|
-| `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | `cmd/consumer` — the consumer group (M3) |
-| `POST /v1/events` — batch validation, per-event rejection with the offending field, and 503 + `Retry-After` when the log is unreachable | `cmd/replay` — dead-letter inspection (M4) |
-| The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | `cmd/gateway` — SSE fan-out and the viewer (M5) |
-| Operational surface: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | Any benchmark number, which is why none appears below |
-| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 20 checks, including reading a posted event back off the broker | |
+| `cmd/migrate` — forward-only migrations plus topic provisioning, idempotent | `cmd/replay` — dead-letter inspection and replay (M4) |
+| `POST /v1/events` — batch validation, per-event rejection with the offending field, and 503 + `Retry-After` when the log is unreachable | `cmd/gateway` — SSE fan-out and the viewer (M5) |
+| `cmd/consumer` — a consumer group that deduplicates in the same transaction as its effects, keeps every observation in history while refusing to move current state backwards, and dead-letters what it cannot apply | `cmd/simulate` — the deterministic fleet producer the benchmarks will drive (M7) |
+| The versioned envelope: an unknown `schema_version` is refused rather than guessed at, unknown fields are refused, and a producer's `event_id` survives so a retransmission stays detectable | Any benchmark number, which is why none appears below |
+| Operational surface on both processes: `/healthz`, `/readyz`, `/metrics`, with dependency gauges kept fresh by a background prober | |
+| CI: `gofmt`, `vet`, the migrations against a real broker, the race suite, a build, and a job that starts the whole stack and smoke-tests it — 24 checks, including a posted event read back off the broker *and* applied to Postgres by the consumer | |
 
-Two properties are decisions rather than accidents. Ingest **does not deduplicate**: it durably
+Three properties are decisions rather than accidents. Ingest **does not deduplicate**: it durably
 records what arrived and lets the consumer's transaction refuse the second effect
 ([ADR-006](docs/adr/ADR-006-dedup-store.md)), because a dedupe cache at this layer would be a
-second, uncoordinated dedupe — and the one that lies when it loses an entry. And a
+second, uncoordinated dedupe — and the one that lies when it loses an entry. A
 partially-acknowledged produce is reported as **failure** so the caller retries the batch: a
-duplicate the pipeline provably absorbs is worth more than a silence nothing can detect.
+duplicate the pipeline provably absorbs is worth more than a silence nothing can detect. And a late
+observation is **kept in history but refused by current state**
+([ADR-005](docs/adr/ADR-005-ordering-and-late-data.md)): the record of what a vehicle reported is
+append-only, while the map it drives cannot move backwards.
 
 The design documents came first: [`docs/DESIGN.md`](docs/DESIGN.md) states the requirements,
 architecture, data model, event flows, failure table, and explicit non-goals, and
@@ -51,6 +57,7 @@ Against dependencies you already run:
 go run ./cmd/migrate all            # schema + topics; idempotent
 go run ./cmd/migrate status         # what is applied, what is pending
 go run ./cmd/ingest                 # DATABASE_URL is required; everything else has a default
+go run ./cmd/consumer               # the consumer group; needs the broker and the database
 ```
 
 `make` targets wrap the same commands, and the raw commands above are listed in the Makefile for
